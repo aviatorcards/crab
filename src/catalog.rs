@@ -276,7 +276,7 @@ fn sync_ubuntu(client: &Client) -> Result<Vec<CatalogEntry>, String> {
                         let mid = &file_part["ubuntu-".len()..file_part.len() - suffix.len()];
                         if !mid.is_empty() && mid.chars().all(|c| c.is_ascii_digit() || c == '.') {
                             let k = version_key(file_part);
-                            if best.as_ref().map_or(true, |(bk, _, _)| k >= *bk) {
+                            if best.as_ref().is_none_or(|(bk, _, _)| k >= *bk) {
                                 best = Some((k, sum_part.trim().to_string(), file_part.to_string()));
                             }
                         }

@@ -15,3 +15,9 @@ chrono = "0.4"
 libc = "0.2"
 rfd = "0.15"
 
+
+[lints.clippy]
+# The codebase nests `if let` rather than using let-chains throughout.
+collapsible_if = "allow"
+# Table headers share their rows' format strings to keep columns aligned.
+print_literal = "allow"

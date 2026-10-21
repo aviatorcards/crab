@@ -1,14 +1,14 @@
 use crate::boot::pick_free_port;
 use crate::config::{
     DEFAULT_CPUS, DEFAULT_MEM, Forward, Paths, ask_yes, disk_kb, file_mtime, fmt_age, fmt_kb,
-    human_size, image_last_boot, image_last_used, list_image_entries, list_image_paths, now_secs,
-    prompt_line, valid_cpus, valid_disk_size, valid_mem, valid_port,
+    human_size, image_last_boot, image_last_used, install_qemu_hint, list_image_entries,
+    list_image_paths, now_secs, prompt_line, valid_cpus, valid_disk_size, valid_mem, valid_port,
 };
 use crate::qmp;
 use chrono::Local;
+use std::env;
 use std::fs;
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -119,7 +119,12 @@ fn dir_name(dir: &Path) -> String {
 }
 
 pub fn check_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.starts_with('.') || name.contains('/') {
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+    {
         return Err(format!("invalid VM name: '{name}'"));
     }
     Ok(())
@@ -141,17 +146,43 @@ pub fn vm_pid(dir: &Path) -> Option<u32> {
     let pid_file = dir.join("qemu.pid");
     let pid_str = fs::read_to_string(&pid_file).ok()?;
     let pid: u32 = pid_str.trim().parse().ok()?;
+    process_name(pid)
+        .is_some_and(|name| name.to_lowercase().contains("qemu"))
+        .then_some(pid)
+}
+
+/// The name of process `pid`, or None if there's no such process.
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_name(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    if out.status.success() {
-        let comm = String::from_utf8_lossy(&out.stdout);
-        if comm.contains("qemu") {
-            return Some(pid);
-        }
-    }
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn process_name(pid: u32) -> Option<String> {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn process_name(_pid: u32) -> Option<String> {
     None
 }
 
@@ -183,25 +214,63 @@ pub fn list_vm_dirs(paths: &Paths) -> Vec<PathBuf> {
     dirs
 }
 
+/// Cross-platform binary search across `PATH` plus standard macOS Homebrew and Windows QEMU install directories.
+pub fn find_executable(name: &str) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
+
+    if let Some(path_os) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_os) {
+            for ext in exts {
+                let candidate = dir.join(format!("{name}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let candidate = Path::new(dir).join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for dir in [r"C:\Program Files\qemu", r"C:\Program Files (x86)\qemu"] {
+            for ext in exts {
+                let candidate = Path::new(dir).join(format!("{name}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    find_executable(cmd).is_some()
+}
+
+pub fn qemu_img_bin() -> PathBuf {
+    find_executable("qemu-img").unwrap_or_else(|| PathBuf::from("qemu-img"))
 }
 
 pub fn need_qemu_img() -> Result<(), String> {
     if !command_exists("qemu-img") {
-        return Err("qemu-img not found (brew install qemu)".to_string());
+        return Err(format!("qemu-img not found ({})", install_qemu_hint()));
     }
     Ok(())
 }
 
 pub fn qemu_img_virt_size(disk: &Path) -> String {
-    let out = Command::new("qemu-img")
+    let out = Command::new(qemu_img_bin())
         .args(["info", "-U"])
         .arg(disk)
         .stderr(Stdio::null())
@@ -224,7 +293,7 @@ pub fn qemu_img_virt_size(disk: &Path) -> String {
 }
 
 pub fn qemu_img_snapshots(disk: &Path) -> Vec<String> {
-    let out = Command::new("qemu-img")
+    let out = Command::new(qemu_img_bin())
         .args(["snapshot", "-l", "-U"])
         .arg(disk)
         .stderr(Stdio::null())
@@ -538,7 +607,7 @@ pub fn create_snapshot(paths: &Paths, name: &str, tag_opt: Option<&str>) -> Resu
     if existing.iter().any(|t| t == &tag) {
         return Err(format!("{name} already has a snapshot called '{tag}'"));
     }
-    let status = Command::new("qemu-img")
+    let status = Command::new(qemu_img_bin())
         .args(["snapshot", "-c", &tag])
         .arg(&disk)
         .status()
@@ -558,7 +627,7 @@ pub fn cmd_snapshot(paths: &Paths, name: &str, tag_opt: Option<&str>) -> Result<
 pub fn list_snapshots_raw(paths: &Paths, name: &str) -> Result<String, String> {
     let dir = vm_path(paths, name)?;
     need_qemu_img()?;
-    let out = Command::new("qemu-img")
+    let out = Command::new(qemu_img_bin())
         .args(["snapshot", "-l", "-U"])
         .arg(dir.join("disk.qcow2"))
         .output()
@@ -580,7 +649,7 @@ pub fn restore_snapshot(paths: &Paths, name: &str, tag: &str) -> Result<(), Stri
     let dir = vm_path(paths, name)?;
     need_qemu_img()?;
     require_stopped(&dir)?;
-    let status = Command::new("qemu-img")
+    let status = Command::new(qemu_img_bin())
         .args(["snapshot", "-a", tag])
         .arg(dir.join("disk.qcow2"))
         .status()
@@ -609,7 +678,7 @@ pub fn delete_snapshot(paths: &Paths, name: &str, tag: &str) -> Result<(), Strin
     let dir = vm_path(paths, name)?;
     need_qemu_img()?;
     require_stopped(&dir)?;
-    let status = Command::new("qemu-img")
+    let status = Command::new(qemu_img_bin())
         .args(["snapshot", "-d", tag])
         .arg(dir.join("disk.qcow2"))
         .status()
@@ -666,13 +735,27 @@ pub fn force_off(dir: &Path) -> Result<(), String> {
         return Err(format!("{name} isn't running"));
     };
     if qmp::quit(dir).is_err() {
+        #[cfg(unix)]
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .status();
+        }
     }
     if !wait_stopped(dir, Duration::from_secs(5)) {
+        #[cfg(unix)]
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .status();
         }
         if !wait_stopped(dir, Duration::from_secs(2)) {
             return Err(format!("{name} (pid {pid}) won't stop"));
@@ -846,7 +929,7 @@ pub fn resize_disk(paths: &Paths, name: &str, size: &str) -> Result<String, Stri
         return Err("SIZE should look like 40G, or +10G to grow by that much".to_string());
     }
     let disk = dir.join("disk.qcow2");
-    let status = Command::new("qemu-img")
+    let status = Command::new(qemu_img_bin())
         .args(["resize", "-q"])
         .arg(&disk)
         .arg(size)
@@ -899,8 +982,24 @@ pub fn cmd_ssh(paths: &Paths, target: &str, command: &[String]) -> Result<(), St
     if vm_pid(&paths.vm_root.join(name)).is_none() {
         return Err(format!("{name} isn't running (boot it with: crab boot {name})"));
     }
-    let err = Command::new(&argv[0]).args(&argv[1..]).args(command).exec();
-    Err(format!("failed to run ssh: {err}"))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = Command::new(&argv[0]).args(&argv[1..]).args(command).exec();
+        Err(format!("failed to run ssh: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(&argv[0])
+            .args(&argv[1..])
+            .args(command)
+            .status()
+            .map_err(|e| format!("failed to run ssh: {e}"))?;
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

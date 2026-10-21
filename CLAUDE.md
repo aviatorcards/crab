@@ -17,11 +17,20 @@ cargo run -- -n some.iso       # dry run: print the QEMU command without booting
 cargo run -- gui               # launch the GUI
 cargo test                     # all unit tests
 cargo test boot::tests::arm64  # tests matching a name
-cargo clippy                   # lint (the existing collapsible_if warnings are known)
+cargo clippy --all-targets -- -D warnings   # lint, as CI runs it (allowed lints are in Cargo.toml)
 cargo install --path .         # install the `crab` binary
 ```
 
-Tests are inline `#[cfg(test)]` modules (binary crate, no lib). Filesystem tests use `config::test_dir(name)` and `config::test_paths(root)` rather than `Paths::new`, which reads `HOME`/`VM_ROOT`. `qmp.rs` tests run a fake QMP server on a Unix socket. The code isn't consistently `rustfmt`-formatted, so don't reformat whole files as part of unrelated changes.
+Tests are inline `#[cfg(test)]` modules (binary crate, no lib). Filesystem tests use `config::test_dir(name)` and `config::test_paths(root)` rather than `Paths::new`, which reads `HOME`/`VM_ROOT`. `qmp.rs` tests run a fake QMP server on a Unix socket, so they're `#[cfg(unix)]`. So are the golden QEMU-command tests, because they spell out Unix paths. Keep `build_qemu_command` free of filesystem access by passing the firmware lookup in, or tests will pick up whatever OVMF/AAVMF the machine has installed. The code isn't consistently `rustfmt`-formatted, so don't reformat whole files as part of unrelated changes.
+
+CI (`.github/workflows/ci.yml`) builds, tests and lints on macOS, Linux and Windows. To type-check the other platforms locally from a Mac, first run `rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu`. `ring` compiles C, so point it at clang plus stub `assert.h`/`string.h`/`stdlib.h` headers. This works for `cargo check`/`clippy` only, not for linking:
+
+```bash
+t=x86_64-unknown-linux-gnu   # or x86_64-pc-windows-gnu
+T=${t//-/_}
+env CC_$T=clang AR_$T=ar CFLAGS_$T=-isystem/path/to/stub-headers \
+  cargo clippy --target $t --all-targets -- -D warnings
+```
 
 To experiment without touching real VMs, set `VM_ROOT=/some/tmp/dir`. Use `-s DIR` or `CRAB_SEARCH_DIR` to change the image search folder.
 

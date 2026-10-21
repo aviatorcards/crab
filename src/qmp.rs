@@ -1,33 +1,71 @@
 //! A minimal client for QEMU's machine protocol (QMP), spoken over the
-//! `qmp.sock` Unix socket that crab gives every VM it boots.
+//! `qmp.sock` Unix socket that crab gives every VM it boots on Unix hosts.
 
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
+use std::io::BufReader;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
-/// macOS limits Unix socket paths to 104 bytes, including the terminating NUL.
+/// macOS limits Unix socket paths to 104 bytes, including the terminating NUL;
+/// Linux allows 108 bytes.
+#[cfg(target_os = "macos")]
 const MAX_SOCKET_PATH: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const MAX_SOCKET_PATH: usize = 107;
 
 pub fn socket_path(vm_dir: &Path) -> PathBuf {
     vm_dir.join("qmp.sock")
 }
 
-/// The socket path to give QEMU, or None if it's too long for macOS to bind.
+/// The socket path to give QEMU, or None if it's too long or unsupported on this platform.
+#[allow(dead_code)]
 pub fn usable_socket_path(vm_dir: &Path) -> Option<PathBuf> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(unix) {
+        "unix"
+    } else {
+        "windows"
+    };
+    usable_socket_path_for_os(vm_dir, os)
+}
+
+pub fn usable_socket_path_for_os(vm_dir: &Path, host_os: &str) -> Option<PathBuf> {
+    if host_os == "windows" {
+        return None;
+    }
+    let max_len = if host_os == "macos" { 103 } else { MAX_SOCKET_PATH };
     let p = socket_path(vm_dir);
-    (p.as_os_str().len() <= MAX_SOCKET_PATH).then_some(p)
+    (p.as_os_str().len() <= max_len).then_some(p)
 }
 
 /// Runs one QMP command against the VM in `vm_dir` and returns its "return" value.
+#[cfg(unix)]
 pub fn execute(vm_dir: &Path, command: &str, arguments: Option<Value>) -> Result<Value, String> {
+    use std::os::unix::net::UnixStream;
     let stream = UnixStream::connect(socket_path(vm_dir))
         .map_err(|e| format!("can't reach the VM's control socket: {e}"))?;
     run_session(stream, command, arguments)
 }
 
-fn run_session(stream: UnixStream, command: &str, arguments: Option<Value>) -> Result<Value, String> {
+#[cfg(not(unix))]
+pub fn execute(_vm_dir: &Path, _command: &str, _arguments: Option<Value>) -> Result<Value, String> {
+    Err("QMP Unix sockets are not supported on Windows; close the QEMU window or use 'crab kill'".to_string())
+}
+
+#[cfg(unix)]
+fn run_session(
+    stream: std::os::unix::net::UnixStream,
+    command: &str,
+    arguments: Option<Value>,
+) -> Result<Value, String> {
     let io_err = |e: std::io::Error| format!("QMP: {e}");
     stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(io_err)?;
     stream.set_write_timeout(Some(Duration::from_secs(3))).map_err(io_err)?;
@@ -49,12 +87,14 @@ fn run_session(stream: UnixStream, command: &str, arguments: Option<Value>) -> R
     read_reply(&mut reader)
 }
 
+#[allow(dead_code)]
 fn send(w: &mut impl Write, msg: &Value) -> Result<(), String> {
     writeln!(w, "{msg}")
         .and_then(|()| w.flush())
         .map_err(|e| format!("QMP: {e}"))
 }
 
+#[allow(dead_code)]
 fn read_message(r: &mut impl BufRead) -> Result<Value, String> {
     let mut line = String::new();
     match r.read_line(&mut line) {
@@ -65,6 +105,7 @@ fn read_message(r: &mut impl BufRead) -> Result<Value, String> {
 }
 
 /// Reads until the reply to the last command, skipping asynchronous events.
+#[allow(dead_code)]
 fn read_reply(r: &mut impl BufRead) -> Result<Value, String> {
     loop {
         let msg = read_message(r)?;
@@ -98,7 +139,7 @@ pub fn quit(vm_dir: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
@@ -149,8 +190,11 @@ mod tests {
 
     #[test]
     fn socket_path_length() {
-        assert!(usable_socket_path(Path::new("/Users/me/VMs/openbsd")).is_some());
-        let long = format!("/Users/me/VMs/{}", "x".repeat(100));
-        assert!(usable_socket_path(Path::new(&long)).is_none());
+        let short = Path::new("/Users/me/VMs/openbsd");
+        let long = format!("/Users/me/VMs/{}", "x".repeat(90));
+        let long = Path::new(&long);
+        assert!(usable_socket_path_for_os(short, "macos").is_some());
+        assert!(usable_socket_path_for_os(long, "macos").is_none());
+        assert!(usable_socket_path_for_os(long, "windows").is_none());
     }
 }

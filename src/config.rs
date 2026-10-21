@@ -1,9 +1,7 @@
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
-use std::os::unix::fs::MetadataExt;
+use std::io::{self, BufRead, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CATALOG_MAX_AGE_DAYS: u64 = 7;
@@ -24,15 +22,30 @@ pub struct Paths {
     pub search_dir: PathBuf,
 }
 
+pub fn home_dir() -> PathBuf {
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return home_dir().join(rest);
+    }
+    PathBuf::from(raw)
+}
+
 impl Paths {
     pub fn new(search_dir_override: Option<PathBuf>) -> Self {
-        let home = env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
+        let home = home_dir();
         let vm_root = env::var("VM_ROOT")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+            .map(|s| expand_tilde(&s))
             .unwrap_or_else(|| home.join("VMs"));
         let scratch_root = vm_root.join(".scratch");
         let history = vm_root.join(".image-history");
@@ -44,9 +57,9 @@ impl Paths {
                 env::var("CRAB_SEARCH_DIR")
                     .ok()
                     .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
+                    .map(|s| expand_tilde(&s))
             })
-            .or_else(|| read_config_key(&config_file, "search_dir").map(PathBuf::from))
+            .or_else(|| read_config_key(&config_file, "search_dir").map(|s| expand_tilde(&s)))
             .unwrap_or_else(|| home.join("Downloads"));
 
         Self {
@@ -117,41 +130,58 @@ pub fn fmt_age(unix_secs: u64) -> String {
     }
 }
 
-pub fn human_size(path: &Path) -> String {
-    let out = Command::new("du")
-        .arg("-sh")
-        .arg(path)
-        .stderr(Stdio::null())
-        .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(first) = s.split('\t').next() {
-                return first.trim().to_string();
+fn allocated_file_bytes(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+pub fn disk_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total += disk_bytes(&entry.path());
             }
         }
+        total
+    } else {
+        allocated_file_bytes(&meta)
     }
-    "?".to_string()
 }
 
 pub fn disk_kb(path: &Path) -> u64 {
-    let flag = if path.is_dir() { "-sk" } else { "-k" };
-    let out = Command::new("du")
-        .arg(flag)
-        .arg(path)
-        .stderr(Stdio::null())
-        .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(first) = s.split('\t').next() {
-                if let Ok(kb) = first.trim().parse::<u64>() {
-                    return kb;
-                }
-            }
-        }
+    (disk_bytes(path) + 512) / 1024
+}
+
+pub fn human_size(path: &Path) -> String {
+    let bytes = disk_bytes(path);
+    if bytes == 0 && !path.exists() {
+        return "?".to_string();
     }
-    0
+    let kb = bytes / 1024;
+    if kb < 1024 {
+        format!("{kb}K")
+    } else if kb < 1_048_576 {
+        let mb = kb as f64 / 1024.0;
+        if mb < 10.0 {
+            format!("{mb:.1}M")
+        } else {
+            format!("{}M", mb.round() as u64)
+        }
+    } else {
+        let gb = kb as f64 / 1_048_576.0;
+        format!("{gb:.1}G")
+    }
 }
 
 pub fn fmt_kb(kb: u64) -> String {
@@ -164,6 +194,13 @@ pub fn fmt_kb(kb: u64) -> String {
 
 pub fn abs_path(p: &Path) -> PathBuf {
     if let Ok(canon) = fs::canonicalize(p) {
+        #[cfg(windows)]
+        {
+            let s = canon.to_string_lossy();
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
         return canon;
     }
     if p.is_absolute() {
@@ -175,8 +212,11 @@ pub fn abs_path(p: &Path) -> PathBuf {
 
 pub fn file_mtime(path: &Path) -> u64 {
     fs::metadata(path)
-        .map(|m| m.mtime() as u64)
-        .unwrap_or_else(|_| now_secs())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_else(now_secs)
 }
 
 pub fn file_birthtime(path: &Path) -> u64 {
@@ -186,7 +226,11 @@ pub fn file_birthtime(path: &Path) -> u64 {
                 return dur.as_secs();
             }
         }
-        return meta.mtime() as u64;
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                return dur.as_secs();
+            }
+        }
     }
     now_secs()
 }
@@ -226,6 +270,18 @@ pub fn host_uname_m() -> &'static str {
         "arm64"
     } else {
         "x86_64"
+    }
+}
+
+pub fn install_qemu_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install qemu"
+    } else if cfg!(target_os = "linux") {
+        "install qemu-system / qemu-utils + OVMF/AAVMF via your package manager"
+    } else if cfg!(target_os = "windows") {
+        "winget install SoftwareFreedomConservancy.QEMU"
+    } else {
+        "install QEMU"
     }
 }
 
@@ -302,14 +358,32 @@ pub fn list_image_paths(paths: &Paths) -> Vec<PathBuf> {
     isos
 }
 
+/// Pure-Rust ISO 9660 Primary Volume Descriptor inspector (works identically on macOS, Linux, and Windows
+/// without shelling out to `file -b`).
+/// Checks sector 16 (offset 0x8000): `\x01CD001` and reads the 32-byte Volume Identifier at offset 40..72.
+pub fn inspect_iso9660(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut pvd = [0u8; 128];
+    f.seek(SeekFrom::Start(0x8000)).ok()?;
+    f.read_exact(&mut pvd).ok()?;
+    if &pvd[1..6] == b"CD001" {
+        let vol_id = String::from_utf8_lossy(&pvd[40..72]);
+        let cleaned = vol_id.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Some(cleaned);
+    }
+    None
+}
+
 pub fn file_brief(path: &Path) -> String {
-    Command::new("file")
-        .arg("-b")
-        .arg(path)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    if let Some(vol) = inspect_iso9660(path) {
+        if vol.is_empty() {
+            return "ISO 9660 CD-ROM filesystem data".to_string();
+        } else {
+            return format!("ISO 9660 CD-ROM filesystem data '{vol}'");
+        }
+    }
+    String::new()
 }
 
 pub fn extract_quoted_label(file_output: &str) -> String {

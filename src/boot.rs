@@ -1,16 +1,16 @@
 use crate::config::{
     DEFAULT_CPUS, DEFAULT_DISK_SIZE, DEFAULT_MEM, Forward, Paths, abs_path, ask_yes, disk_kb,
-    file_brief, fmt_age, host_uname_m, human_size, list_image_entries, log_image_boot, prompt_line,
+    file_brief, fmt_age, host_uname_m, human_size, install_qemu_hint, list_image_entries,
+    log_image_boot, prompt_line,
 };
 use crate::qmp;
 use crate::vm::{
-    check_name, command_exists, conf_get, conf_set, list_vm_dirs, list_vm_entries, need_qemu_img,
-    require_stopped, vm_path,
+    check_name, command_exists, conf_get, conf_set, find_executable, list_vm_dirs, list_vm_entries,
+    need_qemu_img, qemu_img_bin, require_stopped, vm_path,
 };
 use std::fs;
 use std::io::{self, Read};
 use std::net::TcpListener;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -273,19 +273,185 @@ pub fn port_in_use(port_str: &str) -> bool {
 }
 
 fn qemu_share_dir() -> PathBuf {
-    if let Ok(out) = Command::new("brew").args(["--prefix", "qemu"]).output() {
-        if out.status.success() {
-            let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !prefix.is_empty() {
-                return PathBuf::from(prefix).join("share/qemu");
+    if cfg!(target_os = "macos") {
+        if let Ok(out) = Command::new("brew").args(["--prefix", "qemu"]).output() {
+            if out.status.success() {
+                let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !prefix.is_empty() {
+                    return PathBuf::from(prefix).join("share/qemu");
+                }
+            }
+        }
+        let opt = PathBuf::from("/opt/homebrew/share/qemu");
+        if opt.is_dir() {
+            return opt;
+        }
+        return PathBuf::from("/usr/local/share/qemu");
+    }
+    if cfg!(target_os = "windows") {
+        for d in [r"C:\Program Files\qemu\share", r"C:\Program Files (x86)\qemu\share"] {
+            let p = PathBuf::from(d);
+            if p.is_dir() {
+                return p;
             }
         }
     }
-    let opt = PathBuf::from("/opt/homebrew/share/qemu");
-    if opt.is_dir() {
-        return opt;
+    for bin_name in ["qemu-system-x86_64", "qemu-system-aarch64"] {
+        if let Some(bin_path) = find_executable(bin_name) {
+            if let Some(bin_dir) = bin_path.parent() {
+                let share = bin_dir.join("share");
+                if share.is_dir() {
+                    return share;
+                }
+                if let Some(prefix) = bin_dir.parent() {
+                    let pshare = prefix.join("share/qemu");
+                    if pshare.is_dir() {
+                        return pshare;
+                    }
+                }
+            }
+        }
     }
-    PathBuf::from("/usr/local/share/qemu")
+    PathBuf::from("/usr/share/qemu")
+}
+
+/// QEMU's arm64 `virt` machine needs both pflash images padded to exactly 64 MiB.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+const AARCH64_PFLASH_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Distro OVMF / AAVMF packages, as (code, vars template) pairs that belong
+/// together. Each code image must be paired with the vars file built for it:
+/// 4M code with 4M vars, and padded arm64 images only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn distro_uefi_pairs(arch: &str) -> &'static [(&'static str, &'static str)] {
+    match arch {
+        "arm64" => &[
+            // Debian / Ubuntu (qemu-efi-aarch64)
+            ("/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/AAVMF/AAVMF_VARS.fd"),
+            // Fedora (edk2-aarch64)
+            (
+                "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw",
+                "/usr/share/edk2/aarch64/vars-template-pflash.raw",
+            ),
+        ],
+        "amd64" => &[
+            // Debian / Ubuntu (ovmf)
+            ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+            ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+            // Arch (edk2-ovmf)
+            ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+            // Fedora (edk2-ovmf)
+            ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+            ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
+        ],
+        _ => &[
+            // Debian / Ubuntu (ovmf-ia32)
+            ("/usr/share/OVMF/OVMF32_CODE_4M.fd", "/usr/share/OVMF/OVMF32_VARS_4M.fd"),
+            // Arch (edk2-ovmf)
+            ("/usr/share/edk2/ia32/OVMF_CODE.4m.fd", "/usr/share/edk2/ia32/OVMF_VARS.4m.fd"),
+        ],
+    }
+}
+
+/// The first pair whose files both exist and, for arm64, are padded pflash images.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn first_usable_uefi_pair<'a>(
+    arch: &str,
+    pairs: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+) -> Option<(PathBuf, PathBuf)> {
+    let size = |p: &Path| fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len());
+    pairs.into_iter().find_map(|(code, vars)| {
+        let (cs, vs) = (size(code)?, size(vars)?);
+        if arch == "arm64" && (cs != AARCH64_PFLASH_SIZE || vs != AARCH64_PFLASH_SIZE) {
+            return None;
+        }
+        Some((code.to_path_buf(), vars.to_path_buf()))
+    })
+}
+
+/// The (code, vars template) file names QEMU ships in its share directory.
+fn qemu_uefi_names(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "arm64" => ("edk2-aarch64-code.fd", "edk2-arm-vars.fd"),
+        "amd64" => ("edk2-x86_64-code.fd", "edk2-i386-vars.fd"),
+        _ => ("edk2-i386-code.fd", "edk2-i386-vars.fd"),
+    }
+}
+
+/// Resolves UEFI firmware (`code`, `vars_template`) in `qemu_share` first (Homebrew, Windows
+/// installs, QEMU built from source), falling back on Linux to distro OVMF / AAVMF packages.
+/// If nothing usable is found, returns the `qemu_share` paths so the error names them.
+fn resolve_uefi_pair(arch: &str, qemu_share: &Path) -> (PathBuf, PathBuf) {
+    let (code_name, vars_name) = qemu_uefi_names(arch);
+    let primary = (qemu_share.join(code_name), qemu_share.join(vars_name));
+    // QEMU's bundled edk2 images are already the right size for their machines.
+    if primary.0.is_file() && primary.1.is_file() {
+        return primary;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let pairs = distro_uefi_pairs(arch)
+            .iter()
+            .map(|(c, v)| (Path::new(*c), Path::new(*v)));
+        if let Some(found) = first_usable_uefi_pair(arch, pairs) {
+            return found;
+        }
+    }
+
+    primary
+}
+
+fn current_host_spec() -> String {
+    let arch = host_uname_m();
+    if cfg!(target_os = "macos") {
+        format!("macos-{arch}")
+    } else if cfg!(target_os = "linux") {
+        let kvm_ok = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok();
+        if kvm_ok {
+            format!("linux-{arch}")
+        } else {
+            format!("linux-tcg-{arch}")
+        }
+    } else if cfg!(target_os = "windows") {
+        format!("windows-{arch}")
+    } else {
+        format!("other-{arch}")
+    }
+}
+
+fn parse_host_spec(host: &str) -> (&str, &str, &'static str) {
+    if let Some(arch) = host.strip_prefix("macos-") {
+        ("macos", arch, "hvf")
+    } else if let Some(arch) = host.strip_prefix("linux-tcg-") {
+        ("linux", arch, "tcg")
+    } else if let Some(arch) = host.strip_prefix("linux-") {
+        ("linux", arch, "kvm")
+    } else if let Some(arch) = host.strip_prefix("windows-") {
+        ("windows", arch, "whpx")
+    } else if let Some(arch) = host.strip_prefix("other-") {
+        ("other", arch, "tcg")
+    } else {
+        ("macos", host, "hvf")
+    }
+}
+
+fn host_window_display_for(host_os: &str, fullscreen: &str) -> String {
+    match host_os {
+        "macos" => format!("cocoa,zoom-to-fit=on,full-screen={fullscreen}"),
+        "windows" => {
+            if fullscreen == "on" {
+                "sdl,gl=off,window-close=on".to_string()
+            } else {
+                "sdl,gl=off".to_string()
+            }
+        }
+        _ => format!("gtk,zoom-to-fit=on,full-screen={fullscreen}"),
+    }
 }
 
 fn base_name(path: &Path) -> String {
@@ -577,13 +743,46 @@ pub struct QemuCommand {
     pub notes: Vec<String>,
 }
 
-/// Builds the QEMU command line. `force_window` opens a Cocoa window even
-/// for VMs set to use the serial console, since the GUI has no terminal.
+/// The `-accel` and `-cpu` arguments for a guest (`"arm64"` or `"x86"`) on
+/// this host, plus a note if it will run under emulation.
+fn accel_args(guest: &str, host_arch: &str, native_accel: &str) -> (Vec<String>, Option<String>) {
+    let to_args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let same_arch = match guest {
+        "arm64" => host_arch == "arm64",
+        _ => host_arch == "x86_64",
+    };
+    if !same_arch {
+        let note = match guest {
+            "arm64" => "Note: arm64 guest on an x86_64 host runs under emulation (slow).",
+            _ => "Note: x86 guest on an arm64 host runs under emulation (works, but slow).",
+        };
+        return (to_args(&["-accel", "tcg", "-cpu", "max"]), Some(note.to_string()));
+    }
+    match native_accel {
+        // WHPX needs the Windows Hypervisor Platform feature turned on, and
+        // crab can't easily tell whether it is, so QEMU falls back to TCG if
+        // WHPX won't start. That works because -cpu max suits both, whereas
+        // -cpu host would fail under TCG.
+        "whpx" => (to_args(&["-accel", "whpx", "-accel", "tcg", "-cpu", "max"]), None),
+        "tcg" => (
+            to_args(&["-accel", "tcg", "-cpu", "max"]),
+            Some(
+                "Note: no hardware acceleration (can't open /dev/kvm), so the guest runs under emulation (slow)."
+                    .to_string(),
+            ),
+        ),
+        accel => (to_args(&["-accel", accel, "-cpu", "host"]), None),
+    }
+}
+
+/// Builds the QEMU command line, with no filesystem access: `uefi` finds the
+/// (code, vars template) firmware pair for an arch. `force_window` opens a
+/// window even for VMs set to use the serial console, since the GUI has no terminal.
 fn build_qemu_command(
     s: &VmSettings,
     req: &BootRequest,
     host: &str,
-    qemu_share: &Path,
+    uefi: &dyn Fn(&str) -> (PathBuf, PathBuf),
     force_window: bool,
 ) -> Result<QemuCommand, String> {
     let mut args: Vec<String> = Vec::new();
@@ -592,43 +791,36 @@ fn build_qemu_command(
     let mut fw_code: Option<PathBuf>;
     let mut fw_vars_template: Option<PathBuf>;
     let arch = s.arch.as_str();
+    let (host_os, host_arch, native_accel) = parse_host_spec(host);
 
     match arch {
         "arm64" => {
             qemu = "qemu-system-aarch64".to_string();
             args.extend(["-M".to_string(), "virt".to_string()]);
-            fw_code = Some(qemu_share.join("edk2-aarch64-code.fd"));
-            fw_vars_template = Some(qemu_share.join("edk2-arm-vars.fd"));
-            if host == "arm64" {
-                args.extend(["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()]);
-            } else {
-                args.extend(["-accel".into(), "tcg".into(), "-cpu".into(), "max".into()]);
-                notes.push("Note: arm64 guest on an Intel Mac runs under emulation (slow).".into());
-            }
+            let (c, v) = uefi("arm64");
+            fw_code = Some(c);
+            fw_vars_template = Some(v);
+            let (accel, note) = accel_args("arm64", host_arch, native_accel);
+            args.extend(accel);
+            notes.extend(note);
         }
         "amd64" | "i386" => {
-            if arch == "amd64" {
-                qemu = "qemu-system-x86_64".to_string();
-                fw_code = Some(qemu_share.join("edk2-x86_64-code.fd"));
+            qemu = if arch == "amd64" {
+                "qemu-system-x86_64".to_string()
             } else {
-                qemu = "qemu-system-i386".to_string();
-                fw_code = Some(qemu_share.join("edk2-i386-code.fd"));
-            }
-            fw_vars_template = Some(qemu_share.join("edk2-i386-vars.fd"));
+                "qemu-system-i386".to_string()
+            };
+            let (c, v) = uefi(arch);
+            fw_code = Some(c);
+            fw_vars_template = Some(v);
             if s.firmware == "bios" {
                 fw_code = None;
                 fw_vars_template = None;
             }
             args.extend(["-M".to_string(), "q35".to_string()]);
-            if host == "x86_64" {
-                args.extend(["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()]);
-            } else {
-                args.extend(["-accel".into(), "tcg".into(), "-cpu".into(), "max".into()]);
-                notes.push(
-                    "Note: x86 guest on Apple Silicon runs under emulation (works, but slow)."
-                        .into(),
-                );
-            }
+            let (accel, note) = accel_args("x86", host_arch, native_accel);
+            args.extend(accel);
+            notes.extend(note);
         }
         _ => return Err(format!("unsupported architecture: {arch}")),
     }
@@ -680,15 +872,17 @@ fn build_qemu_command(
         "-pidfile".into(),
         vm_dir.join("qemu.pid").display().to_string(),
     ]);
-    match qmp::usable_socket_path(vm_dir) {
-        Some(sock) => args.extend([
-            "-qmp".into(),
-            format!("unix:{},server=on,wait=off", sock.display()),
-        ]),
-        None => notes.push(format!(
-            "Note: {} is too long a path for a control socket, so crab stop won't work for this VM.",
-            vm_dir.display()
-        )),
+    if host_os != "windows" {
+        match qmp::usable_socket_path_for_os(vm_dir, host_os) {
+            Some(sock) => args.extend([
+                "-qmp".into(),
+                format!("unix:{},server=on,wait=off", sock.display()),
+            ]),
+            None => notes.push(format!(
+                "Note: {} is too long a path for a control socket, so crab stop won't work for this VM.",
+                vm_dir.display()
+            )),
+        }
     }
 
     if let Some(img) = &req.image {
@@ -718,10 +912,10 @@ fn build_qemu_command(
     if s.display == "terminal" && !force_window {
         args.push("-nographic".into());
     } else {
-        args.extend([
-            "-display".into(),
-            format!("cocoa,zoom-to-fit=on,full-screen={}", s.fullscreen),
-        ]);
+        args.extend(["-display".into(), host_window_display_for(host_os, &s.fullscreen)]);
+        if host_os == "windows" && s.fullscreen == "on" {
+            args.push("-full-screen".into());
+        }
         if arch == "arm64" {
             if s.gpu == "ramfb" {
                 args.extend(["-device".into(), "ramfb".into()]);
@@ -823,16 +1017,22 @@ pub fn prepare_boot(
         }
     }
 
-    let cmd = build_qemu_command(&settings, req, host_uname_m(), &qemu_share_dir(), force_window)?;
+    let qemu_share = qemu_share_dir();
+    let uefi = |arch: &str| resolve_uefi_pair(arch, &qemu_share);
+    let cmd = build_qemu_command(&settings, req, &current_host_spec(), &uefi, force_window)?;
     notes.extend(cmd.notes);
 
     if !command_exists(&cmd.qemu) {
-        return Err(format!("{} not found (brew install qemu)", cmd.qemu));
+        return Err(format!("{} not found ({})", cmd.qemu, install_qemu_hint()));
     }
     need_qemu_img()?;
     if let Some(code) = &cmd.fw_code {
         if !code.is_file() {
-            return Err(format!("UEFI firmware not found at {}", code.display()));
+            return Err(format!(
+                "UEFI firmware not found at {} ({})",
+                code.display(),
+                install_qemu_hint()
+            ));
         }
     }
     if let Some(tmpl) = &cmd.fw_vars_template {
@@ -858,7 +1058,7 @@ pub fn prepare_boot(
         fs::create_dir_all(vm_dir)
             .map_err(|e| format!("failed to create {}: {e}", vm_dir.display()))?;
         if req.mode != BootMode::Live && !disk.is_file() {
-            let status = Command::new("qemu-img")
+            let status = Command::new(qemu_img_bin())
                 .args(["create", "-q", "-f", "qcow2"])
                 .arg(&disk)
                 .arg(&disk_size)
@@ -1071,17 +1271,36 @@ fn run_cli_boot(paths: &Paths, opts: &BootOptions, req: &BootRequest) -> Result<
         return Ok(());
     }
 
+    let qemu_bin = find_executable(&plan.qemu).unwrap_or_else(|| PathBuf::from(&plan.qemu));
+
     match req.mode {
         BootMode::Vm | BootMode::Named => {
-            let err = Command::new(&plan.qemu).args(&plan.args).exec();
-            Err(format!("failed to exec {}: {err}", plan.qemu))
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = Command::new(&qemu_bin).args(&plan.args).exec();
+                Err(format!("failed to exec {}: {err}", plan.qemu))
+            }
+            #[cfg(not(unix))]
+            {
+                let status = Command::new(&qemu_bin)
+                    .args(&plan.args)
+                    .status()
+                    .map_err(|e| format!("failed to run {}: {e}", plan.qemu))?;
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(())
+            }
         }
         BootMode::Throwaway | BootMode::Live => {
             // Ignore SIGINT in parent while QEMU is running so we survive to ask what to keep.
+            #[cfg(unix)]
             unsafe {
                 libc::signal(libc::SIGINT, libc::SIG_IGN);
             }
-            let status = Command::new(&plan.qemu).args(&plan.args).status();
+            let status = Command::new(&qemu_bin).args(&plan.args).status();
+            #[cfg(unix)]
             unsafe {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
             }
@@ -1195,7 +1414,8 @@ pub fn spawn_from_gui(
         new_vm,
     };
     let spawned = prepare_boot(paths, opts, &req, true).and_then(|plan| {
-        Command::new(&plan.qemu)
+        let qemu_bin = find_executable(&plan.qemu).unwrap_or_else(|| PathBuf::from(&plan.qemu));
+        Command::new(&qemu_bin)
             .args(&plan.args)
             .spawn()
             .map(|child| (child, plan.command_line()))
@@ -1357,6 +1577,12 @@ mod tests {
         }
     }
 
+    /// Firmware as if QEMU's share directory were /share.
+    fn share(arch: &str) -> (PathBuf, PathBuf) {
+        let (code, vars) = qemu_uefi_names(arch);
+        (Path::new("/share").join(code), Path::new("/share").join(vars))
+    }
+
     fn request(mode: BootMode, image: Option<ImageInfo>) -> BootRequest {
         BootRequest {
             mode,
@@ -1368,10 +1594,12 @@ mod tests {
         }
     }
 
+    // The expected command lines use Unix paths.
+    #[cfg(unix)]
     #[test]
     fn arm64_throwaway_command() {
         let req = request(BootMode::Throwaway, Some(image("fedora.iso", true, false)));
-        let cmd = build_qemu_command(&settings("arm64"), &req, "arm64", Path::new("/share"), false).unwrap();
+        let cmd = build_qemu_command(&settings("arm64"), &req, "arm64", &share, false).unwrap();
         assert_eq!(cmd.qemu, "qemu-system-aarch64");
         assert_eq!(
             cmd.args.join(" "),
@@ -1392,6 +1620,8 @@ mod tests {
         assert!(cmd.notes.is_empty());
     }
 
+    // The expected command lines use Unix paths.
+    #[cfg(unix)]
     #[test]
     fn x86_bios_live_under_emulation() {
         let mut s = settings("amd64");
@@ -1401,7 +1631,7 @@ mod tests {
         s.ssh_port.clear();
         s.forwards.clear();
         let req = request(BootMode::Live, Some(image("install76.img", false, true)));
-        let cmd = build_qemu_command(&s, &req, "arm64", Path::new("/share"), false).unwrap();
+        let cmd = build_qemu_command(&s, &req, "arm64", &share, false).unwrap();
         assert_eq!(cmd.qemu, "qemu-system-x86_64");
         assert_eq!(
             cmd.args.join(" "),
@@ -1419,15 +1649,111 @@ mod tests {
         let mut s = settings("amd64");
         s.display = "terminal".into();
         let req = request(BootMode::Vm, None);
-        let cmd = build_qemu_command(&s, &req, "x86_64", Path::new("/share"), true).unwrap();
+        let cmd = build_qemu_command(&s, &req, "x86_64", &share, true).unwrap();
         assert!(!cmd.args.contains(&"-nographic".to_string()));
         assert!(cmd.args.contains(&"cocoa,zoom-to-fit=on,full-screen=off".to_string()));
         assert!(cmd.args.windows(2).any(|w| w == ["-accel", "hvf"]));
     }
 
     #[test]
+    fn linux_x86_64_kvm_and_tcg_commands() {
+        let s = settings("amd64");
+        let req = request(BootMode::Vm, None);
+        let cmd = build_qemu_command(&s, &req, "linux-x86_64", &share, false).unwrap();
+        assert_eq!(cmd.qemu, "qemu-system-x86_64");
+        assert!(cmd.args.windows(4).any(|w| w == ["-accel", "kvm", "-cpu", "host"]));
+        assert!(cmd.args.contains(&"gtk,zoom-to-fit=on,full-screen=off".to_string()));
+        assert!(cmd.notes.is_empty());
+
+        let cmd_nokvm =
+            build_qemu_command(&s, &req, "linux-tcg-x86_64", &share, false).unwrap();
+        assert!(cmd_nokvm.args.windows(4).any(|w| w == ["-accel", "tcg", "-cpu", "max"]));
+        assert!(cmd_nokvm.notes[0].contains("/dev/kvm"), "{:?}", cmd_nokvm.notes);
+    }
+
+    #[test]
+    fn windows_x86_64_whpx_command() {
+        let mut s = settings("amd64");
+        s.fullscreen = "on".into();
+        let req = request(BootMode::Vm, None);
+        let cmd =
+            build_qemu_command(&s, &req, "windows-x86_64", &share, false).unwrap();
+        assert_eq!(cmd.qemu, "qemu-system-x86_64");
+        assert!(
+            cmd.args.windows(6).any(|w| w == ["-accel", "whpx", "-accel", "tcg", "-cpu", "max"]),
+            "WHPX falls back to TCG: {:?}",
+            cmd.args
+        );
+        assert!(cmd.args.contains(&"sdl,gl=off,window-close=on".to_string()));
+        assert!(cmd.args.contains(&"-full-screen".to_string()));
+        assert!(!cmd.args.contains(&"-qmp".to_string()));
+        assert!(cmd.notes.is_empty());
+    }
+
+    #[test]
+    fn uefi_pairs_must_match() {
+        let dir = crate::config::test_dir("uefi-pairs");
+        let file = |name: &str, len: u64| {
+            let p = dir.join(name);
+            fs::File::create(&p).unwrap().set_len(len).unwrap();
+            p
+        };
+        let small_code = file("QEMU_EFI.fd", 2 * 1024 * 1024);
+        let padded_code = file("AAVMF_CODE.fd", AARCH64_PFLASH_SIZE);
+        let padded_vars = file("AAVMF_VARS.fd", AARCH64_PFLASH_SIZE);
+        let missing = dir.join("missing.fd");
+
+        // An unpadded arm64 image is skipped in favour of a padded pair.
+        let pairs = [
+            (small_code.as_path(), padded_vars.as_path()),
+            (padded_code.as_path(), padded_vars.as_path()),
+        ];
+        assert_eq!(
+            first_usable_uefi_pair("arm64", pairs),
+            Some((padded_code.clone(), padded_vars.clone()))
+        );
+        assert_eq!(first_usable_uefi_pair("arm64", [pairs[0]]), None);
+
+        // x86 code and vars sizes differ legitimately, but both must exist.
+        let ovmf_code = file("OVMF_CODE_4M.fd", 4 * 1024 * 1024);
+        let ovmf_vars = file("OVMF_VARS_4M.fd", 540_672);
+        let pairs = [
+            (ovmf_code.as_path(), missing.as_path()),
+            (ovmf_code.as_path(), ovmf_vars.as_path()),
+        ];
+        assert_eq!(first_usable_uefi_pair("amd64", pairs), Some((ovmf_code, ovmf_vars)));
+    }
+
+    #[test]
+    fn distro_uefi_pairs_are_consistent() {
+        for arch in ["arm64", "amd64", "i386"] {
+            for (code, vars) in distro_uefi_pairs(arch) {
+                // A 4M code image needs the 4M vars store built with it.
+                let four_m = |p: &str| p.contains("_4M") || p.contains(".4m");
+                assert_eq!(four_m(code), four_m(vars), "{code} paired with {vars}");
+                assert!(!code.ends_with("/QEMU_EFI.fd"), "{code} isn't padded for pflash");
+            }
+        }
+    }
+
+    #[test]
+    fn accelerators() {
+        let args = |guest, host_arch, accel| accel_args(guest, host_arch, accel).0.join(" ");
+        assert_eq!(args("arm64", "arm64", "hvf"), "-accel hvf -cpu host");
+        assert_eq!(args("x86", "x86_64", "kvm"), "-accel kvm -cpu host");
+        assert_eq!(args("x86", "x86_64", "whpx"), "-accel whpx -accel tcg -cpu max");
+        assert_eq!(args("x86", "arm64", "hvf"), "-accel tcg -cpu max");
+        assert_eq!(args("arm64", "x86_64", "whpx"), "-accel tcg -cpu max");
+
+        let note = |guest, host_arch, accel| accel_args(guest, host_arch, accel).1;
+        assert_eq!(note("arm64", "arm64", "hvf"), None);
+        assert!(note("x86", "arm64", "kvm").unwrap().contains("x86 guest on an arm64 host"));
+        assert!(note("arm64", "x86_64", "hvf").unwrap().contains("arm64 guest on an x86_64 host"));
+    }
+
+    #[test]
     fn unknown_arch() {
         let req = request(BootMode::Vm, None);
-        assert!(build_qemu_command(&settings("riscv64"), &req, "arm64", Path::new("/s"), false).is_err());
+        assert!(build_qemu_command(&settings("riscv64"), &req, "arm64", &share, false).is_err());
     }
 }

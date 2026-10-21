@@ -4,8 +4,8 @@ use crate::catalog::{
     fetch_rss_feed, get_filename, load_catalog, mirror_rules, remove_mirror_matching,
 };
 use crate::config::{
-    DEFAULT_CPUS, DEFAULT_DISK_SIZE, DEFAULT_MEM, ImageEntry, Paths, disk_kb, fmt_age, fmt_kb,
-    host_arch, human_size, list_image_entries,
+    DEFAULT_CPUS, DEFAULT_DISK_SIZE, DEFAULT_MEM, ImageEntry, Paths, disk_kb, expand_tilde,
+    fmt_age, fmt_kb, host_arch, human_size, list_image_entries,
 };
 use crate::vm::{
     VmEntry, check_name, clean_leftover_scratch, create_snapshot, delete_snapshot, delete_vm_dir,
@@ -420,13 +420,7 @@ impl CrabGui {
             }
             Message::SaveSearchDir => {
                 let raw = self.search_dir_input.trim();
-                let expanded = if let Some(rest) = raw.strip_prefix("~/") {
-                    std::env::var("HOME")
-                        .map(|h| PathBuf::from(h).join(rest))
-                        .unwrap_or_else(|_| PathBuf::from(raw))
-                } else {
-                    PathBuf::from(raw)
-                };
+                let expanded = expand_tilde(raw);
                 match self.paths.save_search_dir(expanded.clone()) {
                     Ok(()) => {
                         self.reload_data();
