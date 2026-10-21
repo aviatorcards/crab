@@ -9,7 +9,8 @@ use crate::config::{
 };
 use crate::vm::{
     VmEntry, check_name, clean_leftover_scratch, create_snapshot, delete_snapshot, delete_vm_dir,
-    force_off, list_vm_entries, qemu_img_snapshots, request_shutdown, restore_snapshot, vm_state,
+    force_off, list_vm_entries, qemu_img_snapshots, request_shutdown, restore_snapshot, vm_path,
+    vm_state,
 };
 use iced::border::Radius;
 use iced::widget::{
@@ -17,6 +18,7 @@ use iced::widget::{
     scrollable, text, text_input, vertical_space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Subscription, Task, Theme, Vector, time};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -34,6 +36,12 @@ pub enum Message {
     SwitchPage(ViewPage),
     Refresh,
     Tick,
+    // Background results
+    DataLoaded(u64, LoadedData), // (reload generation, data)
+    VmStatesPolled(Vec<(String, String)>),
+    SnapshotsLoaded(String, Vec<String>),
+    VmOpFinished(String, Result<String, String>), // (VM name, status message)
+    ScratchCleaned(usize, u64),
     // Search directory settings
     SearchDirInputChanged(String),
     SaveSearchDir,
@@ -97,6 +105,47 @@ struct ActiveSession {
     spawned: GuiSpawnedVm,
 }
 
+/// Everything a reload reads from disk, gathered off the UI thread.
+#[derive(Debug, Clone)]
+pub struct LoadedData {
+    vms: Vec<VmEntry>,
+    images: Vec<ImageEntry>,
+    catalog: Vec<CatalogEntry>,
+    mirrors: Vec<(String, String)>,
+    /// The VM that was selected when the load started, and its snapshots.
+    snapshots: Option<(String, Vec<String>)>,
+}
+
+fn load_data(paths: &Paths, selected: Option<String>) -> LoadedData {
+    let vms = list_vm_entries(paths);
+    let snapshots = selected.map(|name| {
+        let snaps = vms
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| qemu_img_snapshots(&v.disk))
+            .unwrap_or_default();
+        (name, snaps)
+    });
+    LoadedData {
+        vms,
+        images: list_image_entries(paths),
+        catalog: load_catalog(paths),
+        mirrors: mirror_rules(paths),
+        snapshots,
+    }
+}
+
+/// Runs blocking `work` on tokio's blocking pool and turns its result into a message.
+fn background<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    done: impl Fn(T) -> Message + Send + 'static,
+) -> Task<Message> {
+    Task::perform(
+        async move { tokio::task::spawn_blocking(work).await.unwrap() },
+        done,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct PendingThrowawayPrompt {
     scratch_dir: PathBuf,
@@ -141,6 +190,12 @@ pub struct CrabGui {
     busy: bool,
     active_sessions: Arc<Mutex<Vec<ActiveSession>>>,
     throwaway_prompt: Option<PendingThrowawayPrompt>,
+    /// Bumped by every reload so results from older, slower loads are dropped.
+    reload_gen: u64,
+    /// A Tick's VM state poll is still running.
+    polling: bool,
+    /// VMs with a stop, kill, delete or snapshot operation in flight.
+    vm_ops: HashSet<String>,
 }
 
 // ---- Palette & Styling Helpers ----
@@ -345,25 +400,45 @@ impl CrabGui {
             busy: false,
             active_sessions: Arc::new(Mutex::new(Vec::new())),
             throwaway_prompt: None,
+            reload_gen: 0,
+            polling: false,
+            vm_ops: HashSet::new(),
         };
-        gui.reload_data();
-        (gui, Task::none())
+        let task = gui.reload();
+        (gui, task)
     }
 
-    fn reload_data(&mut self) {
-        self.vms = list_vm_entries(&self.paths);
-        self.images = list_image_entries(&self.paths);
-        self.catalog = load_catalog(&self.paths);
-        self.mirrors = mirror_rules(&self.paths);
+    /// Re-reads VMs, images, catalog and mirrors in the background; the
+    /// result arrives as `Message::DataLoaded`.
+    fn reload(&mut self) -> Task<Message> {
         self.search_dir_input = self.paths.search_dir.display().to_string();
-        if let Some(ref sel) = self.selected_vm {
-            if let Some(v) = self.vms.iter().find(|v| &v.name == sel) {
-                self.vm_snapshots = qemu_img_snapshots(&v.disk);
-            } else {
-                self.selected_vm = None;
-                self.vm_snapshots.clear();
-            }
+        self.reload_gen += 1;
+        let generation = self.reload_gen;
+        let paths = self.paths.clone();
+        let selected = self.selected_vm.clone();
+        background(
+            move || load_data(&paths, selected),
+            move |data| Message::DataLoaded(generation, data),
+        )
+    }
+
+    /// Runs a slow operation on VM `name` in the background, at most one per
+    /// VM at a time. `work` returns the status message either way.
+    fn vm_op(
+        &mut self,
+        name: String,
+        pending: String,
+        work: impl FnOnce(&Paths) -> Result<String, String> + Send + 'static,
+    ) -> Task<Message> {
+        if !self.vm_ops.insert(name.clone()) {
+            return Task::none();
         }
+        self.status_msg = pending;
+        let paths = self.paths.clone();
+        background(
+            move || work(&paths),
+            move |res| Message::VmOpFinished(name.clone(), res),
+        )
     }
 
     fn build_boot_options(&self) -> BootOptions {
@@ -409,11 +484,61 @@ impl CrabGui {
         match message {
             Message::SwitchPage(p) => {
                 self.page = p;
-                self.reload_data();
+                return self.reload();
             }
             Message::Refresh => {
-                self.reload_data();
                 self.status_msg = "Refreshed VMs, images, catalog, and mirrors.".to_string();
+                return self.reload();
+            }
+            Message::DataLoaded(generation, data) => {
+                if generation != self.reload_gen {
+                    // A newer reload is still on its way.
+                    return Task::none();
+                }
+                self.vms = data.vms;
+                self.images = data.images;
+                self.catalog = data.catalog;
+                self.mirrors = data.mirrors;
+                if let Some(ref sel) = self.selected_vm {
+                    if !self.vms.iter().any(|v| &v.name == sel) {
+                        self.selected_vm = None;
+                        self.vm_snapshots.clear();
+                    } else if let Some((name, snaps)) = data.snapshots {
+                        if &name == sel {
+                            self.vm_snapshots = snaps;
+                        }
+                    }
+                }
+            }
+            Message::VmStatesPolled(states) => {
+                self.polling = false;
+                // Pick up VMs started, stopped or paused outside this window too.
+                let changed = states.iter().any(|(name, state)| {
+                    self.vms
+                        .iter()
+                        .find(|v| &v.name == name)
+                        .is_some_and(|v| &v.state != state)
+                });
+                if changed {
+                    return self.reload();
+                }
+            }
+            Message::SnapshotsLoaded(name, snaps) => {
+                if self.selected_vm.as_deref() == Some(&name) {
+                    self.vm_snapshots = snaps;
+                }
+            }
+            Message::VmOpFinished(name, res) => {
+                self.vm_ops.remove(&name);
+                self.status_msg = res.unwrap_or_else(|e| e);
+                return self.reload();
+            }
+            Message::ScratchCleaned(n, kb) => {
+                self.status_msg = format!(
+                    "Cleaned {n} leftover scratch VM(s), freed {}.",
+                    fmt_kb(kb)
+                );
+                return self.reload();
             }
             Message::SearchDirInputChanged(v) => {
                 self.search_dir_input = v;
@@ -423,11 +548,11 @@ impl CrabGui {
                 let expanded = expand_tilde(raw);
                 match self.paths.save_search_dir(expanded.clone()) {
                     Ok(()) => {
-                        self.reload_data();
                         self.status_msg = format!(
                             "Updated default ISO search/download folder to {}",
                             expanded.display()
                         );
+                        return self.reload();
                     }
                     Err(e) => {
                         self.status_msg = format!("Failed to save search folder: {e}");
@@ -453,12 +578,25 @@ impl CrabGui {
             }
             Message::SearchDirPicked(None) => {}
             Message::Tick => {
-                // Pick up VMs started, stopped or paused outside this window too.
-                let changed = self.vms.iter().any(|v| {
-                    vm_state(&v.dir).unwrap_or_else(|| "stopped".to_string()) != v.state
-                });
-                if changed {
-                    self.reload_data();
+                let mut tasks = Vec::new();
+                // vm_state runs ps and talks QMP, so poll in the background,
+                // and only once at a time in case a guest is slow to answer.
+                if !self.polling {
+                    self.polling = true;
+                    let dirs: Vec<(String, PathBuf)> =
+                        self.vms.iter().map(|v| (v.name.clone(), v.dir.clone())).collect();
+                    tasks.push(background(
+                        move || {
+                            dirs.into_iter()
+                                .map(|(name, dir)| {
+                                    let state =
+                                        vm_state(&dir).unwrap_or_else(|| "stopped".to_string());
+                                    (name, state)
+                                })
+                                .collect()
+                        },
+                        Message::VmStatesPolled,
+                    ));
                 }
                 let mut exited_session: Option<ActiveSession> = None;
                 if let Ok(mut sessions) = self.active_sessions.lock() {
@@ -473,7 +611,7 @@ impl CrabGui {
                     }
                 }
                 if let Some(sess) = exited_session {
-                    self.reload_data();
+                    tasks.push(self.reload());
                     if let Some(scratch) = sess.spawned.scratch_dir {
                         let disk = scratch.join("disk.qcow2");
                         let used_kb = if sess.spawned.live {
@@ -505,6 +643,7 @@ impl CrabGui {
                             format!("VM '{}' stopped.", sess.spawned.default_name);
                     }
                 }
+                return Task::batch(tasks);
             }
             Message::MemChanged(v) => self.mem = v,
             Message::CpusChanged(v) => self.cpus = v,
@@ -534,8 +673,8 @@ impl CrabGui {
                     self.vm_snapshots.clear();
                 } else {
                     self.selected_vm = Some(name.clone());
+                    self.vm_snapshots.clear();
                     if let Some(v) = self.vms.iter().find(|v| v.name == name) {
-                        self.vm_snapshots = qemu_img_snapshots(&v.disk);
                         self.mem = v.mem.clone();
                         self.cpus = v.cpus.clone();
                         self.ssh_port = if v.ssh_port == "0" {
@@ -543,6 +682,12 @@ impl CrabGui {
                         } else {
                             v.ssh_port.clone()
                         };
+                        self.confirm_delete_vm = None;
+                        let disk = v.disk.clone();
+                        return background(
+                            move || qemu_img_snapshots(&disk),
+                            move |snaps| Message::SnapshotsLoaded(name.clone(), snaps),
+                        );
                     }
                 }
                 self.confirm_delete_vm = None;
@@ -555,35 +700,28 @@ impl CrabGui {
                         if let Ok(mut list) = self.active_sessions.lock() {
                             list.push(ActiveSession { spawned });
                         }
-                        self.reload_data();
+                        return self.reload();
                     }
                     Err(e) => self.status_msg = format!("Error booting '{name}': {e}"),
                 }
             }
             Message::StopVm(name) => {
-                let result = self
-                    .vms
-                    .iter()
-                    .find(|v| v.name == name)
-                    .ok_or_else(|| format!("no VM named '{name}'"))
-                    .and_then(|v| request_shutdown(&v.dir));
-                self.status_msg = match result {
-                    Ok(()) => format!("Asked '{name}' to shut down."),
-                    Err(e) => format!("Couldn't shut down '{name}': {e}"),
-                };
+                let n = name.clone();
+                return self.vm_op(name, format!("Asking '{n}' to shut down..."), move |paths| {
+                    vm_path(paths, &n)
+                        .and_then(|dir| request_shutdown(&dir))
+                        .map(|()| format!("Asked '{n}' to shut down."))
+                        .map_err(|e| format!("Couldn't shut down '{n}': {e}"))
+                });
             }
             Message::KillVm(name) => {
-                let result = self
-                    .vms
-                    .iter()
-                    .find(|v| v.name == name)
-                    .ok_or_else(|| format!("no VM named '{name}'"))
-                    .and_then(|v| force_off(&v.dir));
-                self.status_msg = match result {
-                    Ok(()) => format!("Forced '{name}' off."),
-                    Err(e) => format!("Couldn't force '{name}' off: {e}"),
-                };
-                self.reload_data();
+                let n = name.clone();
+                return self.vm_op(name, format!("Forcing '{n}' off..."), move |paths| {
+                    vm_path(paths, &n)
+                        .and_then(|dir| force_off(&dir))
+                        .map(|()| format!("Forced '{n}' off."))
+                        .map_err(|e| format!("Couldn't force '{n}' off: {e}"))
+                });
             }
             Message::ConfirmDeleteVm(name) => {
                 self.confirm_delete_vm = Some(name);
@@ -592,56 +730,50 @@ impl CrabGui {
                 self.confirm_delete_vm = None;
             }
             Message::ExecuteDeleteVm(name) => {
-                match delete_vm_dir(&self.paths, &name) {
-                    Ok(()) => {
-                        self.status_msg = format!("Trashed VM '{name}'.");
-                        self.confirm_delete_vm = None;
-                        if self.selected_vm.as_deref() == Some(&name) {
-                            self.selected_vm = None;
-                        }
-                        self.reload_data();
-                    }
-                    Err(e) => self.status_msg = format!("Error deleting '{name}': {e}"),
-                }
+                // The VM disappears from the list (and selection) on the reload.
+                self.confirm_delete_vm = None;
+                let n = name.clone();
+                return self.vm_op(name, format!("Trashing VM '{n}'..."), move |paths| {
+                    delete_vm_dir(paths, &n)
+                        .map(|()| format!("Trashed VM '{n}'."))
+                        .map_err(|e| format!("Error deleting '{n}': {e}"))
+                });
             }
             Message::SnapshotInputChanged(v) => self.snapshot_tag_input = v,
             Message::CreateSnapshot(name) => {
-                let tag_opt = (!self.snapshot_tag_input.trim().is_empty())
-                    .then(|| self.snapshot_tag_input.trim());
-                match create_snapshot(&self.paths, &name, tag_opt) {
-                    Ok(tag) => {
-                        self.status_msg = format!("Created snapshot '{tag}' for {name}.");
-                        self.snapshot_tag_input.clear();
-                        self.reload_data();
-                    }
-                    Err(e) => self.status_msg = format!("Snapshot error: {e}"),
-                }
+                let tag_opt = Some(self.snapshot_tag_input.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                self.snapshot_tag_input.clear();
+                let n = name.clone();
+                return self.vm_op(name, format!("Snapshotting '{n}'..."), move |paths| {
+                    create_snapshot(paths, &n, tag_opt.as_deref())
+                        .map(|tag| format!("Created snapshot '{tag}' for {n}."))
+                        .map_err(|e| format!("Snapshot error: {e}"))
+                });
             }
             Message::RestoreSnapshot(name, tag) => {
-                match restore_snapshot(&self.paths, &name, &tag) {
-                    Ok(()) => {
-                        self.status_msg = format!("Restored '{name}' to snapshot '{tag}'.");
-                        self.reload_data();
-                    }
-                    Err(e) => self.status_msg = format!("Restore error: {e}"),
-                }
+                let n = name.clone();
+                return self.vm_op(name, format!("Restoring '{n}' to '{tag}'..."), move |paths| {
+                    restore_snapshot(paths, &n, &tag)
+                        .map(|()| format!("Restored '{n}' to snapshot '{tag}'."))
+                        .map_err(|e| format!("Restore error: {e}"))
+                });
             }
             Message::DeleteSnapshot(name, tag) => {
-                match delete_snapshot(&self.paths, &name, &tag) {
-                    Ok(()) => {
-                        self.status_msg = format!("Deleted snapshot '{tag}' from '{name}'.");
-                        self.reload_data();
-                    }
-                    Err(e) => self.status_msg = format!("Delete snapshot error: {e}"),
-                }
+                let n = name.clone();
+                return self.vm_op(name, format!("Deleting snapshot '{tag}'..."), move |paths| {
+                    delete_snapshot(paths, &n, &tag)
+                        .map(|()| format!("Deleted snapshot '{tag}' from '{n}'."))
+                        .map_err(|e| format!("Delete snapshot error: {e}"))
+                });
             }
             Message::CleanScratch => {
-                let (n, kb) = clean_leftover_scratch(&self.paths);
-                self.status_msg = format!(
-                    "Cleaned {n} leftover scratch VM(s), freed {}.",
-                    fmt_kb(kb)
+                self.status_msg = "Cleaning leftover scratch VMs...".to_string();
+                let paths = self.paths.clone();
+                return background(
+                    move || clean_leftover_scratch(&paths),
+                    |(n, kb)| Message::ScratchCleaned(n, kb),
                 );
-                self.reload_data();
             }
             Message::BrowseIso => {
                 let start_dir = self.paths.search_dir.clone();
@@ -675,7 +807,7 @@ impl CrabGui {
                         if let Ok(mut list) = self.active_sessions.lock() {
                             list.push(ActiveSession { spawned });
                         }
-                        self.reload_data();
+                        return self.reload();
                     }
                     Err(e) => self.status_msg = format!("Error booting image: {e}"),
                 }
@@ -695,7 +827,7 @@ impl CrabGui {
                     Ok(()) => {
                         self.status_msg = format!("Trashed image '{fname}'.");
                         self.confirm_delete_image = None;
-                        self.reload_data();
+                        return self.reload();
                     }
                     Err(e) => self.status_msg = format!("Failed to delete '{fname}': {e}"),
                 }
@@ -707,21 +839,14 @@ impl CrabGui {
                 self.busy = true;
                 self.status_msg = "Syncing release catalog from upstream indexes...".to_string();
                 let paths = self.paths.clone();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || cmd_sync(&paths))
-                            .await
-                            .unwrap()
-                    },
-                    Message::SyncFinished,
-                );
+                return background(move || cmd_sync(&paths), Message::SyncFinished);
             }
             Message::SyncFinished(res) => {
                 self.busy = false;
                 match res {
                     Ok(()) => {
-                        self.reload_data();
                         self.status_msg = "Release catalog synced.".to_string();
+                        return self.reload();
                     }
                     Err(e) => {
                         self.status_msg = format!("Sync failed: {e}");
@@ -739,15 +864,10 @@ impl CrabGui {
                     entry.distro, entry.variant, entry.version, file
                 );
                 let paths = self.paths.clone();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let dest =
-                                download_image(&paths, &entry.url, &entry.sha256, &file, false)?;
-                            Ok((entry, dest, boot_after))
-                        })
-                        .await
-                        .unwrap()
+                return background(
+                    move || {
+                        let dest = download_image(&paths, &entry.url, &entry.sha256, &file, false)?;
+                        Ok((entry, dest, boot_after))
                     },
                     Message::DownloadFinished,
                 );
@@ -756,7 +876,6 @@ impl CrabGui {
                 self.busy = false;
                 match res {
                     Ok((entry, path, boot_after)) => {
-                        self.reload_data();
                         self.status_msg = format!("Downloaded {} ready.", path.display());
                         if boot_after {
                             let mut opts = self.build_boot_options();
@@ -773,11 +892,11 @@ impl CrabGui {
                                     if let Ok(mut list) = self.active_sessions.lock() {
                                         list.push(ActiveSession { spawned });
                                     }
-                                    self.reload_data();
                                 }
                                 Err(e) => self.status_msg = format!("Boot error: {e}"),
                             }
                         }
+                        return self.reload();
                     }
                     Err(e) => {
                         self.status_msg = format!("Download failed: {e}");
@@ -796,12 +915,8 @@ impl CrabGui {
                 self.status_msg =
                     format!("Probing mirror '{host}' for Fedora/Ubuntu/Alpine/OpenBSD trees...");
                 let paths = self.paths.clone();
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || add_mirror_entry(&paths, &host, None))
-                            .await
-                            .unwrap()
-                    },
+                return background(
+                    move || add_mirror_entry(&paths, &host, None),
                     Message::MirrorProbeFinished,
                 );
             }
@@ -817,8 +932,8 @@ impl CrabGui {
                     Ok(_) => {
                         self.mirror_official_input.clear();
                         self.mirror_host_input.clear();
-                        self.reload_data();
                         self.status_msg = format!("Added mirror rule: {off} -> {mir}");
+                        return self.reload();
                     }
                     Err(e) => self.status_msg = format!("Error adding mirror: {e}"),
                 }
@@ -828,11 +943,11 @@ impl CrabGui {
                 match res {
                     Ok(added) => {
                         self.mirror_host_input.clear();
-                        self.reload_data();
                         self.status_msg = format!(
                             "Auto-detected and added {} mirror rule(s)!",
                             added.len()
                         );
+                        return self.reload();
                     }
                     Err(e) => {
                         self.status_msg = format!("Mirror probe failed: {e}");
@@ -842,8 +957,8 @@ impl CrabGui {
             Message::RemoveMirrorRule(pattern) => {
                 match remove_mirror_matching(&self.paths, &pattern) {
                     Ok(n) => {
-                        self.reload_data();
                         self.status_msg = format!("Removed {n} mirror rule(s).");
+                        return self.reload();
                     }
                     Err(e) => self.status_msg = format!("Error removing mirror: {e}"),
                 }
@@ -852,8 +967,8 @@ impl CrabGui {
                 if self.paths.mirrors_file.is_file() {
                     let _ = fs::remove_file(&self.paths.mirrors_file);
                 }
-                self.reload_data();
                 self.status_msg = "Reset mirrors to built-in defaults.".to_string();
+                return self.reload();
             }
             Message::RssUrlInputChanged(v) => self.rss_url_input = v,
             Message::FetchRss => {
@@ -863,14 +978,7 @@ impl CrabGui {
                 }
                 self.busy = true;
                 self.status_msg = format!("Fetching RSS feed from {url}...");
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || fetch_rss_feed(&url))
-                            .await
-                            .unwrap()
-                    },
-                    Message::RssFetched,
-                );
+                return background(move || fetch_rss_feed(&url), Message::RssFetched);
             }
             Message::RssFetched(res) => {
                 self.busy = false;
@@ -907,7 +1015,7 @@ impl CrabGui {
                     match fs::rename(&p.scratch_dir, &dest) {
                         Ok(()) => {
                             self.status_msg = format!("Kept throwaway VM as '{name}'.");
-                            self.reload_data();
+                            return self.reload();
                         }
                         Err(e) => {
                             self.status_msg = format!("Failed to save VM: {e}");
@@ -931,7 +1039,7 @@ impl CrabGui {
                         }
                     }
                     self.status_msg = msg;
-                    self.reload_data();
+                    return self.reload();
                 }
             }
         }
