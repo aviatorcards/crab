@@ -4,6 +4,7 @@ use crate::config::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use reqwest::header::RANGE;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -11,7 +12,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
@@ -867,20 +869,73 @@ fn host_from_url(url: &str) -> String {
         .to_string()
 }
 
+/// What `download_image` reports as it goes.
+pub enum DownloadEvent<'a> {
+    /// A status line: which source is being tried, why one was given up on, and so on.
+    Note(&'a str),
+    /// Bytes of the file on disk so far, and its full size if the server said.
+    Progress { done: u64, total: Option<u64> },
+}
+
+/// When a source counts as stalled, so the download moves on to the next one.
+#[derive(Clone, Copy)]
+pub struct StallLimits {
+    /// No data at all for this long.
+    pub silence: Duration,
+    /// Or fewer than `min_bytes` arriving in a `window`.
+    pub window: Duration,
+    pub min_bytes: u64,
+}
+
+pub const STALL_LIMITS: StallLimits = StallLimits {
+    silence: Duration::from_secs(30),
+    window: Duration::from_secs(60),
+    min_bytes: 64 * 1024,
+};
+
+/// Shows `download_image`'s progress on the terminal.
+pub fn terminal_report() -> impl FnMut(DownloadEvent) {
+    let mut bar: Option<ProgressBar> = None;
+    move |event| match event {
+        DownloadEvent::Note(msg) => {
+            if let Some(pb) = bar.take() {
+                pb.finish_and_clear();
+            }
+            println!("{msg}");
+        }
+        DownloadEvent::Progress { done, total } => {
+            let pb = bar.get_or_insert_with(|| match total {
+                Some(total) => ProgressBar::new(total).with_style(
+                    ProgressStyle::with_template("{bar:50.cyan/blue} {bytes}/{total_bytes} ({eta})")
+                        .unwrap()
+                        .progress_chars("##-"),
+                ),
+                None => ProgressBar::new_spinner(),
+            });
+            pb.set_position(done);
+        }
+    }
+}
+
+/// Downloads `file` into the search folder from the first source (mirrors,
+/// then `url`) that gives a file matching `sum`. A partial download is kept
+/// as `file.part` and resumed by the next source or the next attempt.
+/// Setting `cancel` stops it between reads.
 pub fn download_image(
     paths: &Paths,
     url: &str,
     sum: &str,
     file: &str,
     dry_run: bool,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(DownloadEvent),
 ) -> Result<PathBuf, String> {
     let dest = paths.search_dir.join(file);
-    let part = paths.search_dir.join(format!("{file}.part"));
 
     if dest.is_file() {
         let actual = sha256_of_file(&dest).map_err(|e| e.to_string())?;
         if actual.eq_ignore_ascii_case(sum) {
-            println!("Already downloaded: {}", dest.display());
+            report(DownloadEvent::Note(&format!("Already downloaded: {}", dest.display())));
             return Ok(dest);
         }
         return Err(format!(
@@ -891,116 +946,75 @@ pub fn download_image(
 
     let sources = sources_for(paths, url);
     if dry_run {
-        println!("Would download {file}, trying in order:");
+        report(DownloadEvent::Note(&format!("Would download {file}, trying in order:")));
         for s in &sources {
-            println!("  {s}");
+            report(DownloadEvent::Note(&format!("  {s}")));
         }
         return Ok(dest);
     }
 
     fs::create_dir_all(&paths.search_dir).map_err(|e| e.to_string())?;
+    download_from(&sources, sum, &dest, STALL_LIMITS, cancel, report)
+}
 
+fn download_from(
+    sources: &[String],
+    sum: &str,
+    dest: &Path,
+    limits: StallLimits,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(DownloadEvent),
+) -> Result<PathBuf, String> {
+    let file = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let part = dest.with_file_name(format!("{file}.part"));
+    let cancelled = || {
+        format!(
+            "download cancelled (the partial download is kept as {} and resumes next time)",
+            part.display()
+        )
+    };
+
+    // The blocking client applies `timeout` to each read, not the whole body.
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(15))
+        .timeout(limits.silence)
         .user_agent("crab/0.1")
         .build()
         .map_err(|e| e.to_string())?;
 
-    for src in &sources {
+    for src in sources {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         let host = host_from_url(src);
-        println!("Downloading {file} from {host}");
+        report(DownloadEvent::Note(&format!("Downloading {file} from {host}")));
 
-        let existing_len = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        let mut req = client.get(src);
-        if existing_len > 0 {
-            req = req.header(RANGE, format!("bytes={existing_len}-"));
-        }
-
-        let mut finished = true;
-        match req.send() {
-            Ok(mut resp) => {
-                let status = resp.status();
-                if !status.is_success() && status.as_u16() != 206 {
-                    finished = false;
-                    println!("  couldn't get it from {host}");
-                } else {
-                    let append = status.as_u16() == 206 && existing_len > 0;
-                    let total_bytes = resp
-                        .content_length()
-                        .map(|cl| if append { existing_len + cl } else { cl })
-                        .unwrap_or(0);
-
-                    let pb = if total_bytes > 0 {
-                        let pb = ProgressBar::new(total_bytes);
-                        pb.set_style(
-                            ProgressStyle::with_template(
-                                "{bar:50.cyan/blue} {bytes}/{total_bytes} ({eta})",
-                            )
-                            .unwrap()
-                            .progress_chars("##-"),
-                        );
-                        if append {
-                            pb.set_position(existing_len);
-                        }
-                        pb
-                    } else {
-                        ProgressBar::new_spinner()
-                    };
-
-                    let file_res = if append {
-                        fs::OpenOptions::new().create(true).append(true).open(&part)
-                    } else {
-                        fs::File::create(&part)
-                    };
-
-                    match file_res {
-                        Ok(mut out_f) => {
-                            let mut buf = [0u8; 64 * 1024];
-                            loop {
-                                match resp.read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if out_f.write_all(&buf[..n]).is_err() {
-                                            finished = false;
-                                            break;
-                                        }
-                                        pb.inc(n as u64);
-                                    }
-                                    Err(_) => {
-                                        finished = false;
-                                        println!("  couldn't get it from {host}");
-                                        break;
-                                    }
-                                }
-                            }
-                            pb.finish_and_clear();
-                        }
-                        Err(_) => {
-                            finished = false;
-                            pb.finish_and_clear();
-                            println!("  couldn't get it from {host}");
-                        }
-                    }
-                }
+        let complete = match fetch_into(&client, src, &part, limits, cancel, report) {
+            Ok(()) => true,
+            Err(FetchError::Cancelled) => return Err(cancelled()),
+            Err(FetchError::Failed(why)) => {
+                report(DownloadEvent::Note(&format!("  couldn't get it from {host}: {why}")));
+                false
             }
-            Err(_) => {
-                finished = false;
-                println!("  couldn't get it from {host}");
-            }
-        }
+        };
 
         if !part.is_file() {
             continue;
         }
         if let Ok(actual) = sha256_of_file(&part) {
             if actual.eq_ignore_ascii_case(sum) {
-                fs::rename(&part, &dest).map_err(|e| e.to_string())?;
-                println!("Checksum OK: {}", dest.display());
-                return Ok(dest);
+                fs::rename(&part, dest).map_err(|e| e.to_string())?;
+                report(DownloadEvent::Note(&format!("Checksum OK: {}", dest.display())));
+                return Ok(dest.to_path_buf());
             }
         }
-        if finished {
-            println!("  the file from {host} doesn't match the checksum; discarding it");
+        if complete {
+            report(DownloadEvent::Note(&format!(
+                "  the file from {host} doesn't match the checksum; discarding it"
+            )));
             let _ = fs::remove_file(&part);
         }
     }
@@ -1009,6 +1023,88 @@ pub fn download_image(
         "couldn't download {file} from any source (a partial download is kept as {})",
         part.display()
     ))
+}
+
+enum FetchError {
+    Cancelled,
+    Failed(String),
+}
+
+/// Fetches `src` into `part`, resuming from what's already there if the
+/// server supports ranges. Ok means the server sent the whole file.
+fn fetch_into(
+    client: &Client,
+    src: &str,
+    part: &Path,
+    limits: StallLimits,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(DownloadEvent),
+) -> Result<(), FetchError> {
+    let failed = |e: &dyn std::fmt::Display| FetchError::Failed(e.to_string());
+    let existing_len = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    let mut req = client.get(src);
+    if existing_len > 0 {
+        req = req.header(RANGE, format!("bytes={existing_len}-"));
+    }
+    let mut resp = req.send().map_err(|e| failed(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(FetchError::Failed(format!("HTTP {status}")));
+    }
+
+    let append = status == StatusCode::PARTIAL_CONTENT && existing_len > 0;
+    let mut done = if append { existing_len } else { 0 };
+    let total = resp.content_length().map(|n| done + n);
+    let mut out = if append {
+        fs::OpenOptions::new().append(true).open(part)
+    } else {
+        fs::File::create(part)
+    }
+    .map_err(|e| failed(&e))?;
+    report(DownloadEvent::Progress { done, total });
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut window_start = Instant::now();
+    let mut window_bytes = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FetchError::Cancelled);
+        }
+        let n = match resp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => {
+                return Err(FetchError::Failed(format!(
+                    "stalled (no data for {}s)",
+                    limits.silence.as_secs()
+                )));
+            }
+            Err(e) => return Err(failed(&e)),
+        };
+        out.write_all(&buf[..n]).map_err(|e| failed(&e))?;
+        done += n as u64;
+        window_bytes += n as u64;
+        report(DownloadEvent::Progress { done, total });
+
+        if window_start.elapsed() >= limits.window {
+            if window_bytes < limits.min_bytes {
+                return Err(FetchError::Failed(format!(
+                    "stalled (only {window_bytes} bytes in {}s)",
+                    limits.window.as_secs()
+                )));
+            }
+            window_start = Instant::now();
+            window_bytes = 0;
+        }
+    }
+    Ok(())
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut
+        || e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout)
 }
 
 pub fn cmd_get_list(paths: &Paths, arch: &str) {
@@ -1080,7 +1176,15 @@ pub fn cmd_get(paths: &Paths, opts: &BootOptions, spec: Option<&str>) -> Result<
     let file = get_filename(&distro, arch, &entry.url);
     println!("{distro}/{variant} {} for {arch}", entry.version);
 
-    let image_path = download_image(paths, &entry.url, &entry.sha256, &file, opts.dry_run)?;
+    let image_path = download_image(
+        paths,
+        &entry.url,
+        &entry.sha256,
+        &file,
+        opts.dry_run,
+        &AtomicBool::new(false),
+        &mut terminal_report(),
+    )?;
     if opts.download_only {
         return Ok(());
     }
@@ -1093,4 +1197,151 @@ pub fn cmd_get(paths: &Paths, opts: &BootOptions, spec: Option<&str>) -> Result<
     }
 
     cmd_boot(paths, &boot_opts, None, Some(&image_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_dir;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// How the fake mirror answers.
+    #[derive(Clone, Copy)]
+    enum Serve {
+        Full,
+        /// Send this many bytes, then go quiet.
+        StallAfter(usize),
+        /// Send this many bytes, then hang up.
+        CloseAfter(usize),
+        /// A byte every 50ms.
+        Trickle,
+    }
+
+    const LIMITS: StallLimits = StallLimits {
+        silence: Duration::from_millis(300),
+        window: Duration::from_millis(300),
+        min_bytes: 1024,
+    };
+
+    fn body() -> &'static [u8] {
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        Box::leak(data.into_boxed_slice())
+    }
+
+    fn sha256(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    /// An HTTP server on localhost that serves `body` (honouring Range) as `how` says.
+    fn serve(body: &'static [u8], how: Serve) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut start = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        start = r.trim().trim_end_matches('-').parse().unwrap();
+                    }
+                }
+                let rest = &body[start..];
+                let status = if start > 0 { "206 Partial Content" } else { "200 OK" };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    rest.len()
+                );
+                match how {
+                    Serve::Full => {
+                        let _ = stream.write_all(rest);
+                    }
+                    Serve::StallAfter(n) => {
+                        let _ = stream.write_all(&rest[..n]);
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    Serve::CloseAfter(n) => {
+                        let _ = stream.write_all(&rest[..n]);
+                    }
+                    Serve::Trickle => {
+                        for b in rest {
+                            if stream.write_all(&[*b]).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                }
+            }
+        });
+        format!("http://{addr}/image.iso")
+    }
+
+    fn download(
+        name: &str,
+        sources: &[String],
+        cancel: &AtomicBool,
+        mut on_progress: impl FnMut(u64),
+    ) -> (PathBuf, Result<PathBuf, String>, Vec<String>) {
+        let dest = test_dir(name).join("image.iso");
+        let mut notes = Vec::new();
+        let res = download_from(sources, &sha256(body()), &dest, LIMITS, cancel, &mut |e| {
+            match e {
+                DownloadEvent::Note(n) => notes.push(n.to_string()),
+                DownloadEvent::Progress { done, .. } => on_progress(done),
+            }
+        });
+        (dest, res, notes)
+    }
+
+    #[test]
+    fn stalled_mirror_falls_through_and_resumes() {
+        let sources = [serve(body(), Serve::StallAfter(100_000)), serve(body(), Serve::Full)];
+        let (dest, res, notes) = download("stall", &sources, &AtomicBool::new(false), |_| {});
+        assert_eq!(res.unwrap(), dest);
+        assert_eq!(fs::read(&dest).unwrap(), body());
+        assert!(notes.iter().any(|n| n.contains("stalled (no data")), "{notes:?}");
+    }
+
+    #[test]
+    fn trickling_mirror_counts_as_stalled() {
+        let sources = [serve(body(), Serve::Trickle), serve(body(), Serve::Full)];
+        let (dest, res, notes) = download("trickle", &sources, &AtomicBool::new(false), |_| {});
+        assert_eq!(fs::read(res.unwrap()).unwrap(), body());
+        assert!(notes.iter().any(|n| n.contains("stalled (only")), "{notes:?}");
+        assert!(dest.is_file());
+    }
+
+    #[test]
+    fn short_download_is_kept_for_resuming() {
+        let sources = [serve(body(), Serve::CloseAfter(70_000))];
+        let (dest, res, notes) = download("short", &sources, &AtomicBool::new(false), |_| {});
+        assert!(res.is_err());
+        assert!(notes.iter().any(|n| n.contains("couldn't get it")), "{notes:?}");
+        let part = dest.with_file_name("image.iso.part");
+        assert_eq!(fs::metadata(part).unwrap().len(), 70_000);
+    }
+
+    #[test]
+    fn cancel_stops_and_keeps_the_partial_file() {
+        let sources = [serve(body(), Serve::Full), serve(body(), Serve::Full)];
+        let cancel = AtomicBool::new(false);
+        let (dest, res, notes) = download("cancel", &sources, &cancel, |done| {
+            if done > 0 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(res.unwrap_err().contains("cancelled"));
+        assert!(!dest.exists());
+        assert!(dest.with_file_name("image.iso.part").is_file());
+        // It didn't go on to the second source.
+        assert_eq!(notes.iter().filter(|n| n.starts_with("Downloading")).count(), 1);
+    }
 }

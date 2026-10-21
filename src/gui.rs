@@ -1,6 +1,6 @@
 use crate::boot::{BootOptions, GuiSpawnedVm, spawn_from_gui};
 use crate::catalog::{
-    CatalogEntry, RssReleaseItem, add_mirror_entry, cmd_sync, default_variant, download_image,
+    CatalogEntry, DownloadEvent, RssReleaseItem, add_mirror_entry, cmd_sync, default_variant, download_image,
     fetch_rss_feed, get_filename, load_catalog, mirror_rules, remove_mirror_matching,
 };
 use crate::config::{
@@ -13,16 +13,18 @@ use crate::vm::{
     vm_state,
 };
 use iced::border::Radius;
+use iced::futures::SinkExt;
 use iced::widget::{
-    Column, Container, button, checkbox, column, container, horizontal_space, pick_list, row,
-    scrollable, text, text_input, vertical_space,
+    Column, Container, button, checkbox, column, container, horizontal_space, pick_list,
+    progress_bar, row, scrollable, text, text_input, vertical_space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Subscription, Task, Theme, Vector, time};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewPage {
@@ -83,6 +85,9 @@ pub enum Message {
     SyncCatalog,
     SyncFinished(Result<(), String>),
     DownloadRelease(CatalogEntry, bool), // (entry, boot_after)
+    DownloadNote(String),
+    DownloadProgressed(u64, Option<u64>), // (bytes so far, full size)
+    CancelDownload,
     DownloadFinished(Result<(CatalogEntry, PathBuf, bool), String>),
     // Mirrors & RSS actions
     MirrorHostInputChanged(String),
@@ -103,6 +108,15 @@ pub enum Message {
 
 struct ActiveSession {
     spawned: GuiSpawnedVm,
+}
+
+/// The release download in progress, shown above the page.
+struct ActiveDownload {
+    label: String,
+    note: String,
+    done: u64,
+    total: Option<u64>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Everything a reload reads from disk, gathered off the UI thread.
@@ -190,6 +204,7 @@ pub struct CrabGui {
     busy: bool,
     active_sessions: Arc<Mutex<Vec<ActiveSession>>>,
     throwaway_prompt: Option<PendingThrowawayPrompt>,
+    download: Option<ActiveDownload>,
     /// Bumped by every reload so results from older, slower loads are dropped.
     reload_gen: u64,
     /// A Tick's VM state poll is still running.
@@ -400,6 +415,7 @@ impl CrabGui {
             busy: false,
             active_sessions: Arc::new(Mutex::new(Vec::new())),
             throwaway_prompt: None,
+            download: None,
             reload_gen: 0,
             polling: false,
             vm_ops: HashSet::new(),
@@ -863,17 +879,79 @@ impl CrabGui {
                     "Downloading {}/{} ({}) -> {}...",
                     entry.distro, entry.variant, entry.version, file
                 );
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.download = Some(ActiveDownload {
+                    label: format!("{}/{} {}", entry.distro, entry.variant, entry.version),
+                    note: String::new(),
+                    done: 0,
+                    total: None,
+                    cancel: cancel.clone(),
+                });
                 let paths = self.paths.clone();
-                return background(
-                    move || {
-                        let dest = download_image(&paths, &entry.url, &entry.sha256, &file, false)?;
+                let stream = iced::stream::channel(64, move |mut output| async move {
+                    let mut updates = output.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let mut last_progress: Option<Instant> = None;
+                        let mut report = |event: DownloadEvent| {
+                            let msg = match event {
+                                DownloadEvent::Note(note) => {
+                                    Message::DownloadNote(note.trim().to_string())
+                                }
+                                DownloadEvent::Progress { done, total } => {
+                                    // A message per 64K read would flood the UI.
+                                    if last_progress.is_some_and(|t| {
+                                        t.elapsed() < Duration::from_millis(100)
+                                    }) && total != Some(done)
+                                    {
+                                        return;
+                                    }
+                                    last_progress = Some(Instant::now());
+                                    Message::DownloadProgressed(done, total)
+                                }
+                            };
+                            // Dropping an update when the UI is behind is fine.
+                            let _ = updates.try_send(msg);
+                        };
+                        let dest = download_image(
+                            &paths,
+                            &entry.url,
+                            &entry.sha256,
+                            &file,
+                            false,
+                            &cancel,
+                            &mut report,
+                        )?;
                         Ok((entry, dest, boot_after))
-                    },
-                    Message::DownloadFinished,
-                );
+                    })
+                    .await
+                    .unwrap();
+                    let _ = output.send(Message::DownloadFinished(res)).await;
+                });
+                return Task::run(stream, |msg| msg);
+            }
+            Message::DownloadNote(note) => {
+                if let Some(ref mut d) = self.download {
+                    d.note = note;
+                }
+            }
+            Message::DownloadProgressed(done, total) => {
+                if let Some(ref mut d) = self.download {
+                    d.done = done;
+                    d.total = total;
+                }
+            }
+            Message::CancelDownload => {
+                if let Some(ref d) = self.download {
+                    d.cancel.store(true, Ordering::Relaxed);
+                    self.status_msg = format!("Cancelling the {} download...", d.label);
+                }
             }
             Message::DownloadFinished(res) => {
                 self.busy = false;
+                let cancelled = self
+                    .download
+                    .take()
+                    .is_some_and(|d| d.cancel.load(Ordering::Relaxed));
                 match res {
                     Ok((entry, path, boot_after)) => {
                         self.status_msg = format!("Downloaded {} ready.", path.display());
@@ -897,6 +975,11 @@ impl CrabGui {
                             }
                         }
                         return self.reload();
+                    }
+                    Err(_) if cancelled => {
+                        self.status_msg =
+                            "Download cancelled. The partial file is kept and resumes next time."
+                                .to_string();
                     }
                     Err(e) => {
                         self.status_msg = format!("Download failed: {e}");
@@ -1084,6 +1167,7 @@ impl CrabGui {
         .align_y(Alignment::Center);
 
         let settings_bar = self.view_settings_bar();
+        let download_bar = self.download.as_ref().map(view_download);
 
         let main_area: Element<'_, Message> = if let Some(ref prompt) = self.throwaway_prompt {
             self.view_throwaway_modal(prompt)
@@ -1112,11 +1196,14 @@ impl CrabGui {
         let content = column![
             header,
             settings_bar,
+        ]
+        .push_maybe(download_bar)
+        .push(
             Container::new(main_area)
                 .width(Length::Fill)
                 .height(Length::Fill),
-            footer,
-        ]
+        )
+        .push(footer)
         .spacing(14)
         .padding([20, 26]);
 
@@ -1850,6 +1937,46 @@ impl CrabGui {
         .height(Length::Fill)
         .into()
     }
+}
+
+fn view_download(d: &ActiveDownload) -> Element<'_, Message> {
+    let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+    let amount = match d.total {
+        Some(total) if total > 0 => format!(
+            "{:.0} of {:.0} MB ({:.0}%)",
+            mb(d.done),
+            mb(total),
+            d.done as f64 * 100.0 / total as f64
+        ),
+        _ => format!("{:.0} MB", mb(d.done)),
+    };
+    let fraction = d
+        .total
+        .filter(|&t| t > 0)
+        .map_or(0.0, |t| d.done as f32 / t as f32);
+    let cancelling = d.cancel.load(Ordering::Relaxed);
+    container(
+        column![
+            row![
+                text(format!("Downloading {}", d.label)).size(13),
+                horizontal_space(),
+                text(amount).size(12).color(TEXT_MUTED),
+                button(text(if cancelling { "Cancelling..." } else { "Cancel" }).size(12))
+                    .padding([4, 10])
+                    .style(danger_btn_style)
+                    .on_press_maybe((!cancelling).then_some(Message::CancelDownload)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            progress_bar(0.0..=1.0, fraction).height(6),
+            text(&d.note).size(11).color(TEXT_DIM),
+        ]
+        .spacing(6),
+    )
+    .padding([10, 14])
+    .width(Length::Fill)
+    .style(card_style)
+    .into()
 }
 
 pub fn run_gui(paths: Paths, opts: BootOptions) -> Result<(), String> {
