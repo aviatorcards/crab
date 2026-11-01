@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7fe3e6"/>
+      <stop offset="0.68" stop-color="#2aa6c4"/>
+      <stop offset="1" stop-color="#16789f"/>
+    </linearGradient>
+    <linearGradient id="sand" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe3a6"/>
+      <stop offset="1" stop-color="#f0bd6b"/>
+    </linearGradient>
+    <linearGradient id="pail" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2f6fd6"/>
+      <stop offset="0.38" stop-color="#5fa2f5"/>
+      <stop offset="1" stop-color="#1f4fa8"/>
+    </linearGradient>
+    <radialGradient id="shell" cx="0.42" cy="0.25" r="0.85">
+      <stop offset="0" stop-color="#ff8a5c"/>
+      <stop offset="0.6" stop-color="#ee4b32"/>
+      <stop offset="1" stop-color="#c02a22"/>
+    </radialGradient>
+    <clipPath id="tile"><rect x="64" y="64" width="896" height="896" rx="200"/></clipPath>
+    <g id="eye">
+      <path d="M0 62 C-6 30 -6 10 0 -8" fill="none" stroke="#c9301f" stroke-width="30" stroke-linecap="round"/>
+      <circle cx="0" cy="-44" r="60" fill="#fff"/>
+      <circle cx="0" cy="-44" r="60" fill="none" stroke="#3a1712" stroke-width="10"/>
+      <circle cx="-24" cy="-38" r="30" fill="#1d1412"/>
+      <circle cx="-34" cy="-50" r="10" fill="#fff"/>
+    </g>
+    <g id="claw">
+      <path d="M0 0 C 66 -20 118 -86 92 -146 C 80 -128 60 -112 34 -106 C 44 -130 42 -156 22 -176 C -30 -160 -74 -104 -68 -48 C -64 -16 -36 8 0 0 Z" fill="url(#shell)" stroke="#8f1f1a" stroke-width="12" stroke-linejoin="round"/>
+    </g>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect x="64" y="64" width="896" height="896" fill="url(#sea)"/>
+    <path d="M64 240 q 75 -34 150 0 t 150 0 t 150 0 t 150 0 t 150 0 t 150 0" fill="none" stroke="#fff" stroke-opacity="0.45" stroke-width="16" stroke-linecap="round"/>
+    <path d="M-10 350 q 75 -34 150 0 t 150 0 t 150 0 t 150 0 t 150 0 t 150 0 t 150 0" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="16" stroke-linecap="round"/>
+    <path d="M64 806 C 240 742 420 790 560 770 S 840 742 960 790 V 960 H 64 Z" fill="url(#sand)"/>
+    <circle cx="170" cy="880" r="9" fill="#d99f52"/>
+    <circle cx="862" cy="868" r="9" fill="#d99f52"/>
+    <circle cx="800" cy="908" r="6" fill="#d99f52"/>
+    <circle cx="232" cy="914" r="6" fill="#d99f52"/>
+  </g>
+
+  <!-- soft shadow on the sand -->
+  <ellipse cx="512" cy="862" rx="270" ry="36" fill="#7a4d1c" fill-opacity="0.32"/>
+
+  <!-- pail handle, behind everything -->
+  <path d="M236 516 C 250 230 774 230 788 516" fill="none" stroke="#f4c430" stroke-width="26" stroke-linecap="round"/>
+
+  <!-- inside of the pail -->
+  <ellipse cx="512" cy="516" rx="282" ry="82" fill="#163a7c"/>
+
+  <!-- crab, peering out -->
+  <use xlink:href="#eye" href="#eye" x="414" y="300"/>
+  <use xlink:href="#eye" href="#eye" x="598" y="286"/>
+  <path d="M286 566 C 280 400 388 346 512 346 S 744 400 738 566 Z" fill="url(#shell)" stroke="#8f1f1a" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M340 440 C 372 402 420 386 462 386" fill="none" stroke="#ffc2a6" stroke-opacity="0.75" stroke-width="20" stroke-linecap="round"/>
+  <circle cx="620" cy="418" r="12" fill="#a92a22" fill-opacity="0.55"/>
+  <circle cx="662" cy="460" r="9" fill="#a92a22" fill-opacity="0.55"/>
+  <!-- nervous little mouth, just clearing the rim -->
+  <path d="M470 482 q 21 -20 42 0 t 42 0" fill="none" stroke="#6d1512" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- pail front wall -->
+  <path d="M230 516 L 290 846 C 300 892 724 892 734 846 L 794 516 C 770 620 254 620 230 516 Z" fill="url(#pail)"/>
+  <path d="M230 516 C 254 620 770 620 794 516" fill="none" stroke="#a9d0ff" stroke-width="26" stroke-linecap="round"/>
+  <path d="M292 748 C 390 790 634 790 732 748" fill="none" stroke="#fff" stroke-opacity="0.22" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="236" cy="516" r="22" fill="#f4c430" stroke="#a97e12" stroke-width="7"/>
+  <circle cx="788" cy="516" r="22" fill="#f4c430" stroke="#a97e12" stroke-width="7"/>
+
+  <!-- claws hanging on to the rim -->
+  <g transform="translate(330 604) rotate(-8)"><use xlink:href="#claw" href="#claw"/></g>
+  <g transform="translate(694 604) scale(-1 1) rotate(-8)"><use xlink:href="#claw" href="#claw"/></g>
+</svg>
