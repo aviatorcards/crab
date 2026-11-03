@@ -16,8 +16,8 @@ settings:
     DEVELOPMENT_TEAM: ""
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     DEAD_CODE_STRIPPING: YES
-    MARKETING_VERSION: "0.2.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "2"
 
 targets:
   # Everything except the front ends: vm.conf, QEMU command lines, QMP,
@@ -67,6 +67,9 @@ targets:
       path: Crab/Info.plist
       properties:
         CFBundleDisplayName: Crab
+        # Otherwise XcodeGen writes its defaults (1.0 and 1) into Info.plist.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.developer-tools
         NSHumanReadableCopyright: ""
         # Downloads may come from plain-HTTP mirrors; every image is checked
