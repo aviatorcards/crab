@@ -1,4 +1,7 @@
 /build
+# Build output lives here when build/ is a symlink to it, which keeps
+# Spotlight from indexing every Crab.app the builds produce.
+/build.noindex
 /.claude
 .DS_Store
 xcuserdata/
