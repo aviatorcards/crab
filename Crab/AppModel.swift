@@ -115,6 +115,8 @@ final class AppModel {
     var sshPort: String
     /// "auto", "uefi" or "bios".
     var firmware: String
+    /// "auto", "standard", "legacy" or "virtio".
+    var hw: String
     var arch: String
     var gpu: String {
         didSet { UserDefaults.standard.set(gpu, forKey: "defaultGPU") }
@@ -174,6 +176,12 @@ final class AppModel {
     /// QEMU processes started from this window.
     private var sessions: [ObjectIdentifier: SpawnedVM] = [:]
 
+    /// Throwaway and live VMs started from this window that are still running.
+    /// Saved VMs show up in `vms` instead.
+    var runningThrowaways: [SpawnedVM] {
+        sessions.values.filter { $0.scratchDir != nil }.sorted { $0.defaultName < $1.defaultName }
+    }
+
     init() {
         // `crab gui` passes its flags through; ignore the ones macOS and Xcode add.
         var args: [String] = []
@@ -195,6 +203,7 @@ final class AppModel {
         diskSize = opts.diskSize ?? defaults.string(forKey: "defaultDiskSize") ?? defaultDiskSize
         sshPort = opts.sshPort ?? ""
         firmware = opts.firmware ?? "auto"
+        hw = opts.hw ?? "auto"
         arch = opts.arch.flatMap { $0.isEmpty ? nil : $0 } ?? hostArch()
         gpu = opts.gpu ?? defaults.string(forKey: "defaultGPU") ?? "virtio"
         keep = opts.keep
@@ -296,7 +305,8 @@ final class AppModel {
     private func bootOptions() -> BootOptions {
         var opts = BootOptions()
         opts.searchDir = paths.searchDir
-        opts.arch = arch
+        // Only a fallback: images boot as their detected architecture.
+        opts.fallbackArch = arch
         opts.keep = keep
         opts.live = live
         opts.mem = mem
@@ -308,6 +318,7 @@ final class AppModel {
         opts.forwards = nil
         opts.display = nil
         opts.firmware = firmware == "auto" ? nil : firmware
+        opts.hw = hw == "auto" ? nil : hw
         opts.fullscreen = fullscreen ? "on" : "off"
         opts.gpu = gpu
         opts.extraQemuArgs = parseExtraQemuFlags(extraQemuFlags)
@@ -417,9 +428,9 @@ final class AppModel {
     }
 
     func discardThrowaway(_ prompt: ThrowawayPrompt, deleteImage: Bool) {
-        try? FileManager.default.removeItem(at: prompt.scratchDir)
+        try? FileManager.default.trashItem(at: prompt.scratchDir, resultingItemURL: nil)
         status = "Throwaway VM trashed."
-        if deleteImage, let img = prompt.imagePath, (try? FileManager.default.removeItem(at: img)) != nil {
+        if deleteImage, let img = prompt.imagePath, (try? FileManager.default.trashItem(at: img, resultingItemURL: nil)) != nil {
             status = "Throwaway VM and image '\(img.lastPathComponent)' trashed."
         }
         throwawayPrompts.removeAll { $0.id == prompt.id }
@@ -455,9 +466,31 @@ final class AppModel {
         }
     }
 
+    /// Swaps the disc in a running VM's CD drive, or ejects it if `image` is nil.
+    /// `name` keys the operation, so it works for throwaway VMs too.
+    func changeDisc(_ dir: URL, name: String, to image: URL?) {
+        let pending = image.map { "Inserting \($0.lastPathComponent) into '\(name)'..." } ?? "Ejecting the disc from '\(name)'..."
+        vmOp(name, pending: pending) { _ in
+            do throws(CrabError) {
+                return try CrabKit.changeDisc(dir, to: image)
+            } catch {
+                return "Couldn't change the disc: \(error.message)"
+            }
+        }
+    }
+
+    /// Forces off a throwaway VM; its keep-or-discard prompt follows as usual.
+    func forceOffThrowaway(_ vm: SpawnedVM) {
+        guard let dir = vm.scratchDir else { return }
+        vmOp(vm.defaultName, pending: "Forcing '\(vm.defaultName)' off...") { _ in
+            report { () throws(CrabError) in try forceOff(dir) }
+                .map { "Couldn't force '\(vm.defaultName)' off: \($0)" } ?? "Forced '\(vm.defaultName)' off."
+        }
+    }
+
     func deleteVM(_ name: String) {
         vmOp(name, pending: "Trashing '\(name)'...") { paths in
-            report { () throws(CrabError) in try deleteVMDir(paths, name) }
+            report { () throws(CrabError) in try deleteVMDir(paths, name, toTrash: true) }
                 .map { "Couldn't delete '\(name)': \($0)" } ?? "Trashed '\(name)'."
         }
     }
@@ -521,7 +554,7 @@ final class AppModel {
 
     func deleteImage(_ url: URL) {
         do {
-            try FileManager.default.removeItem(at: url)
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
             status = "Trashed image '\(url.lastPathComponent)'."
         } catch {
             status = "Couldn't delete '\(url.lastPathComponent)': \(error.localizedDescription)"

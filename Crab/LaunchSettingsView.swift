@@ -44,6 +44,13 @@ struct LaunchSettingsView: View {
                     Text("UEFI").tag("uefi")
                     Text("BIOS").tag("bios")
                 }
+                Picker("x86 hardware", selection: $model.hw) {
+                    Text("Auto").tag("auto")
+                    Text("Standard").tag("standard")
+                    Text("Legacy PC").tag("legacy")
+                    Text("virtio").tag("virtio")
+                }
+                .help("New x86 VMs: Standard is q35 with AHCI and e1000; Legacy PC is i440fx with IDE and PCnet, for DOS, Windows 9x/XP and other older OSes. Auto picks Legacy PC for images that only boot with BIOS")
                 Picker("Graphics", selection: $model.gpu) {
                     Text("virtio-gpu").tag("virtio")
                     Text("ramfb").tag("ramfb")

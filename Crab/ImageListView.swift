@@ -54,13 +54,13 @@ struct ImageListView: View {
         }
         .fileDialogDefaultDirectory(model.paths.searchDir)
         .confirmationDialog(
-            "Delete \(confirmDelete?.name ?? "")?",
+            "Move \(confirmDelete?.name ?? "") to the Trash?",
             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
             presenting: confirmDelete
         ) { img in
-            Button("Delete Image", role: .destructive) { model.deleteImage(img.path) }
+            Button("Move to Trash", role: .destructive) { model.deleteImage(img.path) }
         } message: { img in
-            Text("This deletes the \(img.sizeHuman) file. You can download it again from Get Distros if it came from there.")
+            Text("This moves the \(img.sizeHuman) file to the Trash. You can download it again from Get Distros if it came from there.")
         }
     }
 }

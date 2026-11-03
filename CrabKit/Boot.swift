@@ -4,6 +4,9 @@ public struct BootOptions: Sendable, Equatable {
     public var searchDir: URL?
     public var arch: String?
     public var knownArch: String?
+    /// The app's architecture setting: used only when an image's architecture
+    /// can't be detected.
+    public var fallbackArch: String?
     public var downloadOnly = false
     public var keep = false
     public var live = false
@@ -17,10 +20,29 @@ public struct BootOptions: Sendable, Equatable {
     public var display: String?
     public var fullscreen: String?
     public var gpu: String?
+    /// "standard", "virtio" or "legacy" (-H).
+    public var hw: String?
     public var dryRun = false
     public var extraQemuArgs: [String] = []
 
     public init() {}
+
+    /// These options minus the settings a VM saves in vm.conf, so booting an
+    /// existing VM from the app keeps what it has instead of taking the app's
+    /// launch settings (which are for new VMs).
+    public func withoutSavedSettings() -> BootOptions {
+        var o = self
+        o.mem = nil
+        o.cpus = nil
+        o.sshPort = nil
+        o.forwards = nil
+        o.firmware = nil
+        o.display = nil
+        o.fullscreen = nil
+        o.gpu = nil
+        o.hw = nil
+        return o
+    }
 }
 
 /// Splits a raw string of command-line flags into individual arguments,
@@ -70,10 +92,16 @@ public func archFromName(_ name: String) -> String? {
     let lower = URL(filePath: name).lastPathComponent.lowercased()
     if lower.contains("aarch64") || lower.contains("arm64") || lower.contains("evbarm") {
         return "arm64"
-    } else if lower.contains("amd64") || lower.contains("x86_64") || lower.contains("x64") {
+    } else if lower.contains("amd64") || lower.contains("x86_64") || lower.contains("x86-64") || lower.contains("x64") {
         return "amd64"
-    } else if lower.contains("i386") || lower.contains("i686") {
+    } else if lower.contains("i386") || lower.contains("i686") || lower.contains("x86") {
         return "i386"
+    }
+    // Whole words only: "ppc" turns up inside other words, and ppc64 is
+    // 64-bit POWER, which crab doesn't boot.
+    let words = Set(URL(filePath: lower).deletingPathExtension().lastPathComponent.split { !$0.isLetter && !$0.isNumber }.map(String.init))
+    if !words.isDisjoint(with: ["ppc", "powerpc", "macppc"]) {
+        return "ppc"
     }
     return nil
 }
@@ -104,29 +132,104 @@ func scanEFILoaders(_ url: URL) -> (aa64: Bool, x64: Bool, ia32: Bool) {
 }
 
 /// Whether `haystack` contains `prefix`, an optional space, an optional dot, then "EFI".
-func matchesEFI<C: RandomAccessCollection>(_ haystack: C, _ prefix: String) -> Bool where C.Element == UInt8, C.Index == Int {
+/// Finds candidates with memmem, since this runs over every byte of an image.
+func matchesEFI<C: Collection>(_ haystack: C, _ prefix: String) -> Bool where C.Element == UInt8 {
     let p = Array(prefix.utf8)
-    let base = haystack.startIndex
-    let n = haystack.count
-    guard n >= p.count + 3 else { return false }
-    let efi: [UInt8] = Array("EFI".utf8)
-    var i = 0
-    while i + p.count + 3 <= n {
-        if haystack[base + i] == p[0] && (1..<p.count).allSatisfy({ haystack[base + i + $0] == p[$0] }) {
-            var j = i + p.count
-            if j < n && haystack[base + j] == UInt8(ascii: " ") { j += 1 }
-            if j < n && haystack[base + j] == UInt8(ascii: ".") { j += 1 }
-            if j + 3 <= n && (0..<3).allSatisfy({ haystack[base + j + $0] == efi[$0] }) {
+    let efi = Array("EFI".utf8)
+    func search(_ buf: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard let base = buf.baseAddress else { return false }
+        let n = buf.count
+        var start = 0
+        while start < n, let hit = memmem(base + start, n - start, p, p.count) {
+            let at = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(hit))
+            var j = at + p.count
+            if j < n && buf[j] == UInt8(ascii: " ") { j += 1 }
+            if j < n && buf[j] == UInt8(ascii: ".") { j += 1 }
+            if j + 3 <= n && buf[j..<j + 3].elementsEqual(efi) {
                 return true
             }
+            start = at + 1
         }
-        i += 1
+        return false
     }
-    return false
+    return haystack.withContiguousStorageIfAvailable(search) ?? Array(haystack).withUnsafeBufferPointer(search)
+}
+
+/// El Torito platform IDs, as found in an ISO's boot catalog.
+enum BootPlatform: UInt8, CaseIterable {
+    case x86BIOS = 0
+    case powerPC = 1
+    case mac = 2
+    case uefi = 0xEF
+}
+
+/// The platforms an ISO's El Torito boot catalog has bootable entries for.
+/// The boot record volume descriptor (among sectors 16-31) points at the
+/// catalog: a validation entry, the default entry, then section headers
+/// (0x90, or 0x91 for the last) each followed by their entries.
+func elToritoPlatforms(_ url: URL) -> Set<UInt8> {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+    defer { try? handle.close() }
+    func sector(_ n: UInt64) -> [UInt8]? {
+        guard (try? handle.seek(toOffset: n * 2048)) != nil,
+              let data = try? handle.read(upToCount: 2048), data.count == 2048 else { return nil }
+        return [UInt8](data)
+    }
+    for n in UInt64(16)..<32 {
+        guard let vd = sector(n), vd[1..<6].elementsEqual("CD001".utf8), vd[0] != 255 else { return [] }
+        guard vd[0] == 0, vd[7..<30].elementsEqual("EL TORITO SPECIFICATION".utf8) else { continue }
+        let lba = vd[0x47..<0x4B].reversed().reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        guard let cat = sector(lba), cat[0] == 1 else { return [] }
+        var found: Set<UInt8> = []
+        if cat[32] == 0x88 {
+            found.insert(cat[1])
+        }
+        var i = 64
+        while i + 32 <= cat.count, cat[i] == 0x90 || cat[i] == 0x91 {
+            let last = cat[i] == 0x91
+            let platform = cat[i + 1]
+            let count = Int(cat[i + 2]) | Int(cat[i + 3]) << 8
+            i += 32
+            for _ in 0..<count where i + 32 <= cat.count {
+                if cat[i] == 0x88 {
+                    found.insert(platform)
+                }
+                i += 32
+            }
+            if last { break }
+        }
+        return found
+    }
+    return []
+}
+
+/// Reads up to `count` bytes at `offset`, or nil if the file is shorter.
+private func readBytes(_ url: URL, at offset: UInt64, count: Int) -> [UInt8]? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    guard (try? handle.seek(toOffset: offset)) != nil,
+          let data = try? handle.read(upToCount: count), data.count == count else { return nil }
+    return [UInt8](data)
+}
+
+/// A PC floppy image: one of the standard floppy sizes, with a boot sector.
+func isFloppyImage(_ url: URL) -> Bool {
+    let sizes: Set<Int> = [368_640, 737_280, 1_228_800, 1_474_560, 1_720_320, 2_949_120]
+    let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
+    guard sizes.contains(size), let boot = readBytes(url, at: 0, count: 512) else { return false }
+    return boot[510] == 0x55 && boot[511] == 0xAA
+}
+
+/// Whether `url` starts with an Apple Driver Map ("ER") followed by an
+/// Apple Partition Map ("PM"), as Mac CDs and disks do.
+func hasApplePartitionMap(_ url: URL) -> Bool {
+    guard let head = readBytes(url, at: 0, count: 514) else { return false }
+    return head[0..<2].elementsEqual("ER".utf8) && head[512..<514].elementsEqual("PM".utf8)
 }
 
 /// The architectures `url` could be: from its name, its ISO volume label,
-/// or the UEFI boot loaders inside it, in that order.
+/// the UEFI boot loaders inside it and its El Torito boot catalog, or, for
+/// a PC floppy image, x86. A Mac disc with no x86 or UEFI way in is PowerPC.
 public func detectArch(_ url: URL) -> [String] {
     if let a = archFromName(url.path) {
         return [a]
@@ -141,8 +244,64 @@ public func detectArch(_ url: URL) -> [String] {
     if label.contains("i386") {
         return ["i386"]
     }
+    let platforms = elToritoPlatforms(url)
+    let pcBootable = platforms.contains(BootPlatform.x86BIOS.rawValue) || platforms.contains(BootPlatform.uefi.rawValue)
+    let macBootable = platforms.contains(BootPlatform.powerPC.rawValue) || platforms.contains(BootPlatform.mac.rawValue)
+    if !pcBootable && (macBootable || hasApplePartitionMap(url)) {
+        return ["ppc"]
+    }
+
     let found = scanEFILoaders(url)
-    return [(found.aa64, "arm64"), (found.x64, "amd64"), (found.ia32, "i386")].filter(\.0).map(\.1)
+    var archs = [(found.aa64, "arm64"), (found.x64, "amd64"), (found.ia32, "i386")].filter(\.0).map(\.1)
+    // 64-bit x86 discs often carry a 32-bit loader too, for 32-bit UEFI tablets.
+    if found.x64 {
+        archs.removeAll { $0 == "i386" }
+    }
+    // A disc that boots x86 BIOS is an x86 disc, even if its boot loader
+    // ships an arm64 build too (ZealOS's Limine has all three). Some arm64
+    // discs mislabel their EFI image as x86, so this only counts when there
+    // are x86 loaders, or none at all.
+    if platforms.contains(BootPlatform.x86BIOS.rawValue) {
+        if archs.contains(where: { $0 != "arm64" }) {
+            archs.removeAll { $0 == "arm64" }
+        } else if archs.isEmpty {
+            archs = ["amd64"]
+        }
+    }
+    if archs.isEmpty && isFloppyImage(url) {
+        archs = ["amd64"]
+    }
+    return archs
+}
+
+/// Why crab can't boot `url`, for images that are plainly for some other
+/// kind of machine. Cheap: it reads only the name and the first sectors.
+public func unsupportedImageReason(_ url: URL) -> String? {
+    let base = url.lastPathComponent
+    let notSupported = "crab only boots arm64, x86 and PowerPC Mac guests"
+    let cpus = [
+        "ppc64": "64-bit POWER", "ppc64le": "64-bit POWER", "ppc64el": "64-bit POWER",
+        "sparc": "SPARC", "sparc64": "SPARC", "mips": "MIPS",
+        "riscv64": "RISC-V", "m68k": "68k", "arm": "32-bit ARM", "armv7": "32-bit ARM", "armhf": "32-bit ARM",
+    ]
+    let words = url.fileStem.lowercased().split { !$0.isLetter && !$0.isNumber }
+    if let cpu = words.lazy.compactMap({ cpus[String($0)] }).first {
+        return "\(base) looks like a \(cpu) image; \(notSupported)"
+    }
+    if url.pathExtension.lowercased() == "dmg" {
+        return "\(base) is a macOS disk image (.dmg), not an OS to boot"
+    }
+    return nil
+}
+
+/// `detectArch`, but an image that's plainly for another kind of machine
+/// is an error rather than an empty list. That's checked first, since
+/// `detectArch` may read the whole image; a name naming an arch crab boots wins.
+func detectBootableArch(_ url: URL) throws(CrabError) -> [String] {
+    if archFromName(url.path) == nil, let why = unsupportedImageReason(url) {
+        throw CrabError(why)
+    }
+    return detectArch(url)
 }
 
 public func hasEFILoader(_ url: URL) -> Bool {
@@ -151,7 +310,13 @@ public func hasEFILoader(_ url: URL) -> Bool {
 }
 
 public func isCDImage(_ url: URL) -> Bool {
-    url.isFile ? fileBrief(url).contains("ISO 9660") : url.pathExtension.lowercased() == "iso"
+    let ext = url.pathExtension.lowercased()
+    guard url.isFile else { return ext == "iso" }
+    if fileBrief(url).contains("ISO 9660") {
+        return true
+    }
+    // Mac CDs are often plain HFS with an Apple partition map, no ISO 9660.
+    return ["iso", "cdr", "toast"].contains(ext) && hasApplePartitionMap(url)
 }
 
 public func isBSDImage(_ url: URL) -> Bool {
@@ -466,8 +631,20 @@ func resolveSettings(
 ) throws(CrabError) -> (VMSettings, [String]) {
     var notes: [String] = []
 
-    let mem = flagOrSaved(opts.mem, conf("mem")) ?? defaultMem
-    let cpus = flagOrSaved(opts.cpus, conf("cpus")) ?? String(defaultCPUs)
+    let ppc = arch == "ppc"
+    // Mac OS 9 can't use more than 1.5G, and QEMU's mac99 has a single CPU.
+    var mem = flagOrSaved(opts.mem, conf("mem")) ?? (ppc ? defaultPPCMem : defaultMem)
+    if ppc, let mb = memMB(mem), mb > maxPPCMemMB {
+        notes.append("PowerPC Macs get at most \(maxPPCMemMB)M (Mac OS 9 won't boot with more); using \(maxPPCMemMB)M.")
+        mem = "\(maxPPCMemMB)M"
+    }
+    var cpus = flagOrSaved(opts.cpus, conf("cpus")) ?? String(defaultCPUs)
+    if ppc && cpus != "1" {
+        if opts.cpus != nil {
+            notes.append("PowerPC Macs (mac99) have one CPU; using 1.")
+        }
+        cpus = "1"
+    }
 
     // New VMs get a free SSH port unless one was asked for; -p 0 turns it off.
     var sshPort: String
@@ -500,7 +677,12 @@ func resolveSettings(
     }()
 
     let firmware: String
-    if let f = flagOrSaved(opts.firmware, conf("firmware")) {
+    if ppc {
+        if opts.firmware.map({ !$0.isEmpty }) == true {
+            throw CrabError("PowerPC Macs boot with Open Firmware; -f is for x86 guests")
+        }
+        firmware = "openbios"
+    } else if let f = flagOrSaved(opts.firmware, conf("firmware")) {
         firmware = f
     } else if let image, arch != "arm64", !hasEFI() {
         notes.append("No UEFI boot loader in \(baseName(image.path)); using legacy BIOS.")
@@ -515,10 +697,22 @@ func resolveSettings(
     let gpu = flagOrSaved(opts.gpu, conf("gpu")) ?? "virtio"
     let fullscreen = flagOrSaved(opts.fullscreen, conf("fullscreen")) ?? "off"
 
-    // New x86 VMs get an AHCI disk and an e1000 network card, which every x86
-    // OS has drivers for. arm64 OSes all speak virtio, and so did VMs from
-    // older versions of vmboot.
-    let hw = flagOrSaved(nil, conf("hw")) ?? (newVM && arch != "arm64" ? "standard" : "virtio")
+    // New x86 VMs get an AHCI disk and an e1000 network card, which x86 OSes
+    // since the mid-2000s have drivers for. Ones that can only boot with BIOS
+    // are older, so they get the legacy PC: i440fx, IDE and a PCnet card,
+    // which DOS-era CD drivers, Windows 9x and XP understand. arm64 OSes all
+    // speak virtio, and so did VMs from older versions of vmboot.
+    // PowerPC VMs are always QEMU's mac99 (a G4 Power Mac).
+    if ppc && opts.hw.map({ !$0.isEmpty }) == true {
+        throw CrabError("PowerPC Macs always use mac99 hardware; -H is for x86 guests")
+    }
+    let hw = ppc ? "mac99" : flagOrSaved(opts.hw, conf("hw")) ?? {
+        guard newVM && arch != "arm64" else { return "virtio" }
+        return firmware == "bios" ? "legacy" : "standard"
+    }()
+    if arch == "arm64" && hw != "virtio" {
+        throw CrabError("arm64 guests always use virtio hardware")
+    }
 
     let settings = VMSettings(
         arch: arch, firmware: firmware, mem: mem, cpus: cpus, display: display, sshPort: sshPort,
@@ -579,10 +773,18 @@ func buildQemuCommand(
         if s.firmware != "bios" {
             (fwCode, fwVarsTemplate) = uefi(arch)
         }
-        args += ["-M", "q35"]
+        args += ["-M", s.hw == "legacy" ? "pc" : "q35"]
         let (accel, note) = accelArgs(guest: "x86", hostArch: hostArch)
         args += accel
         if let note { notes.append(note) }
+    case "ppc":
+        // A G4 Power Mac with a PMU (which brings USB keyboard and mouse),
+        // booting QEMU's built-in OpenBIOS. vga-ndrv lets Mac OS change the
+        // screen resolution.
+        qemu = "qemu-system-ppc"
+        args += ["-M", "mac99,via=pmu", "-accel", "tcg"]
+        args += ["-prom-env", "auto-boot?=true", "-prom-env", "vga-ndrv?=true"]
+        notes.append("Note: PowerPC guests run under emulation (works, but slow).")
     default:
         throw CrabError("unsupported architecture: \(arch)")
     }
@@ -598,7 +800,12 @@ func buildQemuCommand(
         ]
     }
 
-    let (diskIf, nic) = s.hw == "standard" ? ("ide", "e1000") : ("virtio", "virtio-net-pci")
+    let (diskIf, nic) = switch s.hw {
+    case "standard": ("ide", "e1000")
+    case "legacy": ("ide", "pcnet")
+    case "mac99": ("ide", "sungem")
+    default: ("virtio", "virtio-net-pci")
+    }
 
     args += ["-name", req.displayName, "-m", s.mem, "-smp", s.cpus]
 
@@ -643,8 +850,15 @@ func buildQemuCommand(
                 "-device", "scsi-cd,drive=cd,bootindex=1",
             ]
         } else {
-            args += ["-drive", "file=\(path),media=cdrom,readonly=on"]
+            // Index 2 (secondary master) is where QEMU puts its default CD
+            // drive, so taking it leaves one drive instead of ours plus an empty one.
+            args += ["-drive", "file=\(path),media=cdrom,readonly=on,index=2"]
         }
+    }
+    // OpenBIOS boots one device and doesn't fall back to the next, so boot
+    // the CD while one is attached.
+    if arch == "ppc" {
+        args += ["-boot", req.image?.isCD == true ? "d" : "c"]
     }
 
     if s.display == "terminal" && !forceWindow {
@@ -816,7 +1030,7 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
         } else if let oa = opts.arch {
             detected = oa
         } else {
-            let candidates = detectArch(img)
+            let candidates = try detectBootableArch(img)
             if candidates.count == 1 {
                 detected = candidates[0]
                 print("Detected architecture: \(detected)")
@@ -825,7 +1039,7 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
                 let list: [String]
                 if candidates.isEmpty {
                     print("Couldn't detect the architecture of \(base).")
-                    list = ["arm64", "amd64", "i386"]
+                    list = ["arm64", "amd64", "i386", "ppc"]
                 } else {
                     print("\(base) has boot loaders for more than one architecture. Which is it?")
                     list = candidates
@@ -907,7 +1121,7 @@ func runCLIBoot(_ paths: Paths, _ opts: BootOptions, _ req: BootRequest) throws(
 
     if s.display == "terminal" {
         print("Serial console in this terminal. Quit QEMU with Ctrl-A then X.")
-        if s.arch != "arm64" {
+        if s.arch == "amd64" || s.arch == "i386" {
             print("Tip: if output stops after the boot loader, type 'set tty com0' at the boot> prompt.")
         }
     } else {
@@ -988,8 +1202,18 @@ public final class SpawnedVM: @unchecked Sendable {
     }
 }
 
+/// The architecture the app boots an image as: one given outright, else the
+/// first detected, else the app's fallback setting, else this Mac's.
+func guiImageArch(_ opts: BootOptions, detect: () throws(CrabError) -> [String]) throws(CrabError) -> String {
+    func given(_ a: String?) -> String? { a.flatMap { $0.isEmpty ? nil : $0 } }
+    if let a = given(opts.knownArch) ?? given(opts.arch) {
+        return a
+    }
+    return try detect().first ?? given(opts.fallbackArch) ?? hostArch()
+}
+
 /// Prepares and starts a VM or image in a QEMU window without prompting:
-/// images use the first detected arch, or this Mac's. Blocks while it
+/// images use `guiImageArch`. Existing VMs keep their saved settings. Blocks while it
 /// scans the image, so call it off the main thread. `onExit` runs (on a
 /// background thread) when QEMU exits.
 public func spawnFromGUI(
@@ -1016,7 +1240,7 @@ public func spawnFromGUI(
     }
 
     if let img = image {
-        let detected = opts.knownArch ?? opts.arch ?? detectArch(img).first ?? hostArch()
+        let detected = try guiImageArch(opts) { () throws(CrabError) in try detectBootableArch(img) }
         defaultName = defaultVMName(img, arch: detected)
         arch = detected
     }
@@ -1055,8 +1279,9 @@ public func spawnFromGUI(
         mode: mode, vmDir: vmDir, image: image.map(ImageInfo.probe), arch: arch,
         defaultName: defaultName, newVM: newVM
     )
+    let bootOpts = newVM ? opts : opts.withoutSavedSettings()
     do throws(CrabError) {
-        let plan = try prepareBoot(paths, opts, req, forceWindow: true)
+        let plan = try prepareBoot(paths, bootOpts, req, forceWindow: true)
         let process = Process()
         process.executableURL = findExecutable(plan.qemu) ?? URL(filePath: plan.qemu)
         process.arguments = plan.args

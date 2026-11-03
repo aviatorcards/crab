@@ -305,11 +305,16 @@ public func cmdClean(_ paths: Paths, days: Int) {
     print("Freed \(fmtKB(freed)).")
 }
 
-public func deleteVMDir(_ paths: Paths, _ name: String) throws(CrabError) {
+/// Deletes a VM's folder, or moves it to the Trash if `toTrash`.
+public func deleteVMDir(_ paths: Paths, _ name: String, toTrash: Bool = false) throws(CrabError) {
     let dir = try vmPath(paths, name)
     try requireStopped(dir)
     do {
-        try FileManager.default.removeItem(at: dir)
+        if toTrash {
+            try FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+        } else {
+            try FileManager.default.removeItem(at: dir)
+        }
     } catch {
         throw CrabError("failed to delete \(dir.path): \(error.localizedDescription)")
     }
@@ -449,6 +454,59 @@ public func forceOff(_ dir: URL) throws(CrabError) {
     try? FileManager.default.removeItem(at: QMP.socketPath(dir))
 }
 
+/// Swaps the disc in a running VM's CD drive, or ejects it if `image` is
+/// nil. Returns a message saying what happened.
+public func changeDisc(_ dir: URL, to image: URL?) throws(CrabError) -> String {
+    let name = dirName(dir)
+    let drive = try runningCDDrive(dir)
+    if let image {
+        guard image.isFile else {
+            throw CrabError("no such image: \(image.path)")
+        }
+        try QMP.changeMedium(dir, device: drive.device, image: absPath(image))
+        return "Inserted \(image.lastPathComponent) into \(name)."
+    }
+    try QMP.changeMedium(dir, device: drive.device, image: nil)
+    return "Ejected \(drive.image?.lastPathComponent ?? "the disc") from \(name)."
+}
+
+private func runningCDDrive(_ dir: URL) throws(CrabError) -> QMP.CDDrive {
+    let name = dirName(dir)
+    if vmPID(dir) == nil {
+        throw CrabError("\(name) isn't running")
+    }
+    if !QMP.socketPath(dir).exists {
+        throw CrabError("\(name) was booted without a control socket, so its disc can't be changed")
+    }
+    do throws(CrabError) {
+        return try QMP.cdDrive(dir)
+    } catch where error.message.hasSuffix("has no CD drive") {
+        throw CrabError("\(name) has no CD drive (arm64 VMs only get one when booted with an image)")
+    } catch {
+        throw error
+    }
+}
+
+/// `crab disc NAME [IMAGE|eject]`. A bare file name is looked for in the
+/// image folder too, so the next disc of a set is easy to name.
+public func cmdDisc(_ paths: Paths, _ name: String, _ arg: String?) throws(CrabError) {
+    let dir = try vmPath(paths, name)
+    guard let arg else {
+        let drive = try runningCDDrive(dir)
+        print(drive.image.map { "\(name) has \($0.lastPathComponent) in its CD drive." } ?? "\(name)'s CD drive is empty.")
+        return
+    }
+    if arg == "eject" {
+        print(try changeDisc(dir, to: nil))
+        return
+    }
+    var image = URL(filePath: arg)
+    if !image.isFile && !arg.contains("/") {
+        image = paths.searchDir.appending(path: arg)
+    }
+    print(try changeDisc(dir, to: image))
+}
+
 public func cmdStop(_ paths: Paths, _ name: String) throws(CrabError) {
     let dir = try vmPath(paths, name)
     try requestShutdown(dir)
@@ -487,6 +545,9 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
         return value
     case "cpus":
         guard validCPUs(value) else { throw CrabError("cpus wants a number of CPUs") }
+        if arch == "ppc" && value != "1" {
+            throw CrabError("PowerPC Macs (mac99) have one CPU")
+        }
         return value
     case "ssh_port":
         guard validPort(value) else { throw CrabError("ssh_port wants a port number (0 turns it off)") }
@@ -499,6 +560,9 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
     case "fwd":
         return Forward.listToConf(try Forward.parseList(value))
     case "firmware":
+        if arch == "ppc" {
+            throw CrabError("PowerPC Macs always boot with Open Firmware")
+        }
         if arch == "arm64" && value == "bios" {
             throw CrabError("arm64 guests always boot with UEFI")
         }
@@ -506,7 +570,14 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
     case "display": return try oneOf(["window", "terminal"])
     case "gpu": return try oneOf(["virtio", "ramfb"])
     case "fullscreen": return try oneOf(["on", "off"])
-    case "hw": return try oneOf(["standard", "virtio"])
+    case "hw":
+        if arch == "ppc" {
+            throw CrabError("PowerPC Macs always use mac99 hardware")
+        }
+        if arch == "arm64" && value != "virtio" {
+            throw CrabError("arm64 guests always use virtio hardware")
+        }
+        return try oneOf(["standard", "virtio", "legacy"])
     default:
         throw CrabError("can't set '\(key)'; settable keys are: \(settableKeys.joined(separator: " "))")
     }

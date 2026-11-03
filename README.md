@@ -28,7 +28,9 @@ Try out OS images on your Mac (Apple Silicon or Intel) in throwaway QEMU VMs, ke
 
   Redox and 9front images are packed with zstd and gzip, and are unpacked after download (zstd comes with Homebrew's QEMU). 9front publishes no checksums, so its downloads are marked unverified.
 - **Multi-Architecture (`arm64`, `amd64`, `i386`):**
-  - Automatically detects guest architecture (`arm64`, `amd64`, `i386`) from filenames, ISO 9660 volume labels, or embedded UEFI boot loaders (`BOOTAA64.EFI`, `BOOTX64.EFI`, `BOOTIA32.EFI`).
+  - Automatically detects guest architecture (`arm64`, `amd64`, `i386`) from filenames, ISO 9660 volume labels, embedded UEFI boot loaders (`BOOTAA64.EFI`, `BOOTX64.EFI`, `BOOTIA32.EFI`), the ISO's El Torito boot catalog, or PC floppy boot sectors. Images for other machines (PowerPC, SPARC, 32-bit ARM, `.dmg`) are refused with a clear message.
+  - PowerPC Mac discs (Mac OS 9, Mac OS X up to 10.5, macppc BSDs) boot as `ppc` guests on QEMU's `mac99` G4 Power Mac with Open Firmware, under emulation.
+  - Older x86 OSes that can only boot with BIOS (DOS, Windows 9x/XP, ...) get a legacy PC (`-H legacy`: i440fx, IDE, PCnet); newer ones get q35 with AHCI and e1000.
   - Uses Hypervisor.framework (`hvf`) when the guest matches your Mac's architecture, falling back to `tcg` emulation otherwise.
   - Opens guests in QEMU's `cocoa` window and uses the UEFI firmware (`edk2-*`) that ships with Homebrew's QEMU.
   - Attaches real ISO 9660 images as CD-ROMs and hybrid/raw disk images (like OpenBSD `install*.img` or Redox `livedisk.iso`) with a temporary snapshot overlay so the source image is never modified.
@@ -48,7 +50,7 @@ New VMs get an SSH forward on the first free port from 2222 up (`-p PORT` picks 
 
 ### Control Socket
 
-Every VM crab boots gets a QMP control socket at `~/VMs/<name>/qmp.sock`. `crab stop`, `crab kill`, the live state in `crab list` (`running`, `paused`, `shutdown`, …) and the app's Shut Down / Force Off buttons use it. VMs booted by `vmboot` don't have one; `crab kill` still works for them.
+Every VM crab boots gets a QMP control socket at `~/VMs/<name>/qmp.sock`. `crab stop`, `crab kill`, `crab disc`, the live state in `crab list` (`running`, `paused`, `shutdown`, …) and the app's Shut Down / Force Off / Change Disc controls use it. VMs booted by `vmboot` don't have one; `crab kill` still works for them.
 
 ## Requirements
 
@@ -134,6 +136,8 @@ You can also edit `~/VMs/mirrors` directly or manage folders, mirrors, and RSS f
 crab list                     # arch, firmware, RAM, CPUs, SSH, disk use, snapshots, state, last used
 crab stop openbsd             # press the power button and wait (offers to force it off after a minute)
 crab kill openbsd             # force it off now
+crab disc panther "Apple Mac OS X 10.3.0 - Disk 2.iso"   # swap the CD in a running VM (for multi-disc installers)
+crab disc panther eject       # empty its CD drive
 crab ssh openbsd              # ssh in through the VM's forwarded port
 crab ssh root@openbsd -- uname -a
 crab set openbsd              # show saved settings

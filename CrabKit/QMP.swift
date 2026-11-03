@@ -47,6 +47,39 @@ public enum QMP {
         _ = try execute(vmDir, "system_powerdown")
     }
 
+    /// A VM's CD drive (QEMU's block device name) and the image in it, if any.
+    public struct CDDrive: Sendable, Equatable {
+        public var device: String
+        public var image: URL?
+    }
+
+    /// The VM's CD drive: its first removable drive that isn't a floppy.
+    /// x86 and PowerPC VMs always have one; arm64 VMs only when booted with an image.
+    public static func cdDrive(_ vmDir: URL) throws(CrabError) -> CDDrive {
+        guard let blocks = try execute(vmDir, "query-block") as? [[String: Any]] else {
+            throw CrabError("QMP: unexpected query-block reply")
+        }
+        for block in blocks {
+            guard block["removable"] as? Bool == true, let device = block["device"] as? String,
+                  !device.isEmpty, !device.hasPrefix("floppy") else { continue }
+            let file = (block["inserted"] as? [String: Any])?["file"] as? String
+            return CDDrive(device: device, image: file.map { URL(filePath: $0) })
+        }
+        throw CrabError("the VM has no CD drive")
+    }
+
+    /// Puts `image` in `device`, or empties it if `image` is nil. `force`
+    /// gets past a tray the guest has locked, as installers often do.
+    public static func changeMedium(_ vmDir: URL, device: String, image: URL?) throws(CrabError) {
+        if let image {
+            _ = try execute(vmDir, "blockdev-change-medium", arguments: [
+                "device": device, "filename": image.path, "format": "raw", "read-only-mode": "read-only", "force": true,
+            ])
+        } else {
+            _ = try execute(vmDir, "eject", arguments: ["device": device, "force": true])
+        }
+    }
+
     /// Tells QEMU to exit right away, like pulling the plug.
     public static func quit(_ vmDir: URL) throws(CrabError) {
         do {

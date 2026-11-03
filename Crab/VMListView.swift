@@ -1,5 +1,6 @@
 import CrabKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct VMListView: View {
     @Environment(AppModel.self) private var model
@@ -9,35 +10,32 @@ struct VMListView: View {
 
     var body: some View {
         Group {
-            if model.vms.isEmpty {
+            if model.vms.isEmpty && model.runningThrowaways.isEmpty {
                 ContentUnavailableView(
                     "No Saved VMs",
                     systemImage: "desktopcomputer",
                     description: Text("Boot an image and keep it when the VM closes, or choose “Save permanently” in the launch settings. VMs live in \(model.vmRootDisplay).")
                 )
             } else {
-                List(model.vms) { vm in
-                    VMRow(vm: vm, onSnapshots: { snapshotsFor = vm }, onDelete: { confirmDelete = vm })
-                        .contextMenu {
-                            Button("Snapshots…") { snapshotsFor = vm }
-                            Button("Clone…") { nameEdit = NameEdit(vm: vm, kind: .clone) }
-                                .disabled(vm.runningPID != nil)
-                            Button("Rename…") { nameEdit = NameEdit(vm: vm, kind: .rename) }
-                                .disabled(vm.runningPID != nil)
-                            Divider()
-                            Button("Show in Finder") {
-                                NSWorkspace.shared.activateFileViewerSelecting([vm.dir])
+                List {
+                    if model.runningThrowaways.isEmpty {
+                        ForEach(model.vms) { vm in
+                            savedRow(vm)
+                        }
+                    } else {
+                        Section("Running Throwaway VMs") {
+                            ForEach(model.runningThrowaways, id: \.process.processIdentifier) { vm in
+                                ThrowawayRow(vm: vm)
                             }
-                            if !vm.sshPort.isEmpty && vm.sshPort != "0" {
-                                Button("Copy SSH Command") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString("crab ssh \(vm.name)", forType: .string)
+                        }
+                        if !model.vms.isEmpty {
+                            Section("Saved VMs") {
+                                ForEach(model.vms) { vm in
+                                    savedRow(vm)
                                 }
                             }
-                            Divider()
-                            Button("Move to Trash…", role: .destructive) { confirmDelete = vm }
-                                .disabled(vm.runningPID != nil)
                         }
+                    }
                 }
             }
         }
@@ -48,13 +46,109 @@ struct VMListView: View {
             NameEditSheet(edit: edit)
         }
         .confirmationDialog(
-            "Delete \(confirmDelete?.name ?? "")?",
+            "Move \(confirmDelete?.name ?? "") to the Trash?",
             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
             presenting: confirmDelete
         ) { vm in
-            Button("Delete VM", role: .destructive) { model.deleteVM(vm.name) }
+            Button("Move to Trash", role: .destructive) { model.deleteVM(vm.name) }
         } message: { vm in
-            Text("This deletes \(vm.dir.path) (\(vm.diskUsed)), including its disk and snapshots.")
+            Text("This moves \(vm.dir.path) (\(vm.diskUsed)) to the Trash, including its disk and snapshots.")
+        }
+    }
+
+    private func savedRow(_ vm: VMEntry) -> some View {
+        VMRow(vm: vm, onSnapshots: { snapshotsFor = vm }, onDelete: { confirmDelete = vm })
+            .contextMenu {
+                Button("Snapshots…") { snapshotsFor = vm }
+                Button("Clone…") { nameEdit = NameEdit(vm: vm, kind: .clone) }
+                    .disabled(vm.runningPID != nil)
+                Button("Rename…") { nameEdit = NameEdit(vm: vm, kind: .rename) }
+                    .disabled(vm.runningPID != nil)
+                Divider()
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([vm.dir])
+                }
+                if !vm.sshPort.isEmpty && vm.sshPort != "0" {
+                    Button("Copy SSH Command") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString("crab ssh \(vm.name)", forType: .string)
+                    }
+                }
+                Divider()
+                Button("Move to Trash…", role: .destructive) { confirmDelete = vm }
+                    .disabled(vm.runningPID != nil)
+            }
+    }
+}
+
+/// A throwaway or live VM started from the app that's still running.
+private struct ThrowawayRow: View {
+    @Environment(AppModel.self) private var model
+    let vm: SpawnedVM
+
+    var body: some View {
+        let busy = model.vmOps.contains(vm.defaultName)
+        HStack(spacing: 12) {
+            Image(systemName: "play.desktopcomputer")
+                .font(.title2)
+                .foregroundStyle(.green)
+                .frame(width: 30)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(vm.defaultName)
+                        .font(.headline)
+                    Tag(vm.live ? "live" : "throwaway", color: .orange)
+                }
+                if let image = vm.imagePath {
+                    Text("from \(image.lastPathComponent)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if busy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            if let dir = vm.scratchDir {
+                ChangeDiscMenu(dir: dir, name: vm.defaultName)
+                    .disabled(busy)
+            }
+            Button("Force Off", role: .destructive) { model.forceOffThrowaway(vm) }
+                .disabled(busy)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+/// Swaps the disc in a running VM's CD drive: any image from the image
+/// folder, another file, or none.
+struct ChangeDiscMenu: View {
+    @Environment(AppModel.self) private var model
+    let dir: URL
+    let name: String
+    @State private var choosingFile = false
+
+    var body: some View {
+        Menu("Change Disc") {
+            ForEach(model.images) { img in
+                Button(img.name) { model.changeDisc(dir, name: name, to: img.path) }
+            }
+            if !model.images.isEmpty {
+                Divider()
+            }
+            Button("Other…") { choosingFile = true }
+            Button("Eject") { model.changeDisc(dir, name: name, to: nil) }
+        }
+        .fixedSize()
+        .help("Swap the disc in the VM's CD drive, for installers that span several discs")
+        .fileImporter(
+            isPresented: $choosingFile,
+            allowedContentTypes: [.diskImage] + ["iso", "img", "cdr", "toast"].compactMap { UTType(filenameExtension: $0) }
+        ) { result in
+            if case .success(let url) = result {
+                model.changeDisc(dir, name: name, to: url)
+            }
         }
     }
 }
@@ -99,6 +193,8 @@ private struct VMRow: View {
                     .controlSize(.small)
             }
             if running {
+                ChangeDiscMenu(dir: vm.dir, name: vm.name)
+                    .disabled(busy)
                 Button("Shut Down") { model.stopVM(vm.name) }
                     .disabled(busy)
                 Button("Force Off", role: .destructive) { model.forceOffVM(vm.name) }

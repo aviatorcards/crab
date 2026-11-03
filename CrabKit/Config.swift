@@ -2,6 +2,9 @@ import Foundation
 
 public let catalogMaxAgeDays: Int = 7
 public let defaultMem = "2G"
+public let defaultPPCMem = "512M"
+/// Mac OS 9 on QEMU's mac99 fails to boot with more than this (in MB).
+public let maxPPCMemMB = 1536
 public let defaultCPUs = 2
 public let defaultDiskSize = "20G"
 public let defaultCleanDays: Int = 30
@@ -314,6 +317,16 @@ public func validMem(_ s: String) -> Bool {
         num = num.dropLast()
     }
     return !num.isEmpty && num.allSatisfy(\.isASCIIDigit)
+}
+
+/// A size as `validMem` accepts it, in MB (QEMU reads a bare number as MB).
+func memMB(_ s: String) -> Int? {
+    guard validMem(s) else { return nil }
+    switch s.last {
+    case "G", "g": return Int(s.dropLast()).map { $0 * 1024 }
+    case "M", "m": return Int(s.dropLast())
+    default: return Int(s)
+    }
 }
 
 public func validCPUs(_ s: String) -> Bool {

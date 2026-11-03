@@ -2,7 +2,7 @@ import Foundation
 
 public let commands = [
     "boot", "get", "sync", "list", "images", "clean", "delete", "snapshot", "snapshots", "restore",
-    "delsnap", "mirrors", "dir", "stop", "kill", "ssh", "set", "clone", "rename", "resize",
+    "delsnap", "mirrors", "dir", "stop", "kill", "ssh", "set", "clone", "rename", "resize", "disc",
 ]
 
 public struct CLI: Sendable, Equatable {
@@ -46,7 +46,7 @@ public func parseArgs(_ rawArgs: [String]) throws(CrabError) -> CLI {
             while j < chars.count {
                 let c = chars[j]
                 switch c {
-                case "s", "a", "m", "c", "z", "p", "P", "f":
+                case "s", "a", "m", "c", "z", "p", "P", "f", "H":
                     let val: String
                     if j + 1 < chars.count {
                         val = String(chars[(j + 1)...])
@@ -65,6 +65,7 @@ public func parseArgs(_ rawArgs: [String]) throws(CrabError) -> CLI {
                     case "z": cli.opts.diskSize = val
                     case "p": cli.opts.sshPort = val
                     case "P": cli.opts.forwards = (cli.opts.forwards ?? []) + (try Forward.parseList(val))
+                    case "H": cli.opts.hw = val
                     default: cli.opts.firmware = val
                     }
                     i += 1
@@ -104,6 +105,9 @@ public func parseArgs(_ rawArgs: [String]) throws(CrabError) -> CLI {
     if let fw = opts.firmware, fw != "uefi" && fw != "bios" {
         throw CrabError("-f wants uefi or bios")
     }
+    if let hw = opts.hw, !["standard", "virtio", "legacy"].contains(hw) {
+        throw CrabError("-H wants standard, virtio or legacy")
+    }
     switch opts.arch {
     case nil, "", "arm64", "amd64": break
     case "aarch64": cli.opts.arch = "arm64"
@@ -140,6 +144,8 @@ public func usageText(_ paths: Paths) -> String {
            crab boot [options] NAME     boot a saved VM
            crab stop NAME               ask a running VM to shut down
            crab kill NAME               force a running VM off
+           crab disc NAME [IMAGE|eject] show, change or eject a running VM's CD
+                                        (IMAGE may be a file name in the search folder)
            crab ssh [USER@]NAME [-- COMMAND...]
                                         ssh into a running VM through its forwarded port
            crab list                    list saved VMs
@@ -157,7 +163,8 @@ public func usageText(_ paths: Paths) -> String {
            crab delsnap NAME TAG        delete a snapshot
 
     Images boot in a throwaway VM: when QEMU exits you're asked whether to keep
-    it, and if not, its disk is deleted.
+    it, and if not, its disk is deleted. crab boots arm64, x86 (amd64, i386)
+    and PowerPC Mac (ppc: Mac OS 9, Mac OS X up to 10.5) guests.
 
     Boot options:
       -s DIR    where to look for (and download) .iso/.img files (default: ~/Downloads)
@@ -165,14 +172,17 @@ public func usageText(_ paths: Paths) -> String {
       -d        with get: download only, don't boot
       -k        keep: make a named VM straight away instead of a throwaway one
       -l        live: boot the image with no disk at all (for live ISOs)
-      -m MEM    guest RAM (default: \(defaultMem))
-      -c N      guest CPUs (default: \(defaultCPUs))
+      -m MEM    guest RAM (default: \(defaultMem); PowerPC: \(defaultPPCMem))
+      -c N      guest CPUs (default: \(defaultCPUs); PowerPC Macs have one)
       -z SIZE   size of a new VM's disk (default: \(defaultDiskSize))
       -p PORT   forward localhost:PORT to the guest's SSH port (new VMs get a free
                 port from 2222 up; -p 0 turns it off)
       -P H:G    forward localhost port H to guest port G (repeatable; udp:H:G for
                 UDP; -P 0 drops saved forwards)
       -f FW     x86 firmware: uefi or bios (new x86 VMs default to uefi)
+      -H HW     x86 hardware: standard (q35, AHCI, e1000), legacy (i440fx, IDE,
+                PCnet: for DOS, Windows 9x/XP and other pre-2006 OSes) or virtio.
+                New x86 VMs that boot with BIOS default to legacy, others to standard
       -g        graphical window
       -t        serial console in this terminal (default for BSD installers)
       -F        start the window full screen
@@ -182,7 +192,7 @@ public func usageText(_ paths: Paths) -> String {
       --gui     open the Crab app
       -h        show this help
 
-    -m, -c, -p, -P, -f, -g, -t, -F and -r are saved with a VM and reused on its next
+    -m, -c, -p, -P, -f, -H, -g, -t, -F and -r are saved with a VM and reused on its next
     boot; change them without booting using crab set (keys: \(settableKeys.joined(separator: " "))).
     VMs live in \(paths.vmRoot.path)/<name>/ (set VM_ROOT to keep them elsewhere).
 

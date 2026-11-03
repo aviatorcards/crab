@@ -35,7 +35,7 @@ struct ThrowawaySheet: View {
 
             HStack {
                 if let image = prompt.imagePath, FileManager.default.fileExists(atPath: image.path) {
-                    Button("Trash VM and Delete \(image.lastPathComponent)", role: .destructive) {
+                    Button("Trash VM and \(image.lastPathComponent)", role: .destructive) {
                         model.discardThrowaway(prompt, deleteImage: true)
                     }
                 }

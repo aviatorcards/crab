@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `crab` boots OS images (`.iso`/`.img`) on macOS in throwaway QEMU VMs, with a native SwiftUI desktop GUI (`Crab.app`) and a command-line tool (`crab`). It is a Swift rewrite of `vmboot.sh`, which is not in this repo. It must stay compatible with VM folders that `vmboot` created, so treat the on-disk layout and fallbacks below as the compatibility contract.
 
-Runtime requirements: QEMU and its UEFI firmware (install via `brew install qemu`). The code calls `qemu-system-*` and `qemu-img`, plus `brew --prefix qemu` to find Homebrew installs, and `ps` on Unix.
+Runtime requirements: QEMU and its UEFI firmware (install via `brew install qemu`). The code calls `qemu-system-*` (aarch64, x86_64, i386, ppc) and `qemu-img`, plus `brew --prefix qemu` to find Homebrew installs, and `ps` on Unix.
 
 ## Commands
 
@@ -28,11 +28,11 @@ Managed via XcodeGen (`project.yml`), producing `Crab.xcodeproj` with four targe
 
 - **`CrabKit`**: static framework containing core logic:
   - `Arguments.swift`: command-line argument parsing and flag extraction.
-  - `Boot.swift`: architecture detection (filename → ISO 9660 label → embedded `BOOT*.EFI` scan), picker menu, and building the QEMU command line (binary, machine, accelerator `hvf`/`tcg`, firmware, disk/CD attach, display, SSH forward).
+  - `Boot.swift`: architecture detection (filename → ISO 9660 label → embedded `BOOT*.EFI` scan, refined by the El Torito boot catalog; floppy boot sectors; Apple partition maps → `ppc`; `unsupportedImageReason` for ppc64/SPARC/ARM32/`.dmg`), picker menu, and building the QEMU command line (binary, machine, accelerator `hvf`/`tcg`, firmware, disk/CD attach, display, SSH forward).
   - `Catalog.swift`: release catalog sync for Fedora, Ubuntu, Alpine and OpenBSD from official indexes, mirror rules (built-in or `~/VMs/mirrors` with auto-probing), RSS release feeds, and resumable `.part` downloads with SHA-256 verification.
   - `Config.swift`: `Paths` (on-disk locations derived from `VM_ROOT`, default `~/VMs`), default constants, validators (`validMem` etc.), `Forward` port-forward type, and shared helpers.
   - `Process.swift`: process execution helpers, finding executables, and child process management.
-  - `QMP.swift`: synchronous QMP client for `<vm>/qmp.sock` (`queryStatus`, `systemPowerdown`, `quit`). macOS caps socket paths at 104 bytes, so `usableSocketPath` returns nil for long paths and those VMs boot without a socket.
+  - `QMP.swift`: synchronous QMP client for `<vm>/qmp.sock` (`queryStatus`, `systemPowerdown`, `quit`, `cdDrive`/`changeMedium` for disc swaps). macOS caps socket paths at 104 bytes, so `usableSocketPath` returns nil for long paths and those VMs boot without a socket.
   - `VM.swift`: saved-VM bookkeeping (`confGet`/`confSet`, inspecting/listing VMs, snapshots, resize, stop/kill, set, clone/rename, ssh).
 - **`crab`**: the command-line executable (`crab/main.swift`).
 - **`Crab`**: SwiftUI macOS application (`CrabApp.swift`, `ContentView.swift`, `AppModel.swift`, `VMListView.swift`, `ImageListView.swift`, `ReleasesView.swift`, `MirrorsView.swift`, `LaunchSettingsView.swift`, `ThrowawaySheet.swift`). Embeds the `crab` binary in `Contents/Helpers/crab`.
@@ -76,4 +76,4 @@ Each setting is resolved in this order: CLI flag, then the VM's saved `vm.conf` 
 ~/VMs/config              crab-only settings (e.g. search_dir=)
 ```
 
-Hardware defaults depend on whether the VM was created by older vmboot versions. New x86 VMs get `hw=standard` (AHCI + e1000), while arm64 VMs and older VMs get `virtio`. VMs without a `display` key default to the serial terminal on arm64. Don't change these fallbacks without accounting for existing VMs.
+Hardware defaults depend on whether the VM was created by older vmboot versions. New x86 VMs get `hw=standard` (q35, AHCI + e1000), or `hw=legacy` (i440fx, IDE + PCnet; crab-only) when they boot with BIOS, while arm64 VMs and older VMs get `virtio`. arm64 only allows `virtio`. `ppc` VMs (mac99, OpenBIOS, one CPU) always save `hw=mac99` and `firmware=openbios`. VMs without a `display` key default to the serial terminal on arm64. Don't change these fallbacks without accounting for existing VMs.

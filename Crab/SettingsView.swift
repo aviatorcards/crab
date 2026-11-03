@@ -240,6 +240,16 @@ public struct SettingsView: View {
                     Text("UEFI (EDK2)").tag("uefi")
                     Text("Legacy BIOS (x86)").tag("bios")
                 }
+
+                Picker("Default x86 Hardware", selection: $bindableModel.hw) {
+                    Text("Automatic").tag("auto")
+                    Text("Standard (q35, AHCI, e1000)").tag("standard")
+                    Text("Legacy PC (i440fx, IDE, PCnet)").tag("legacy")
+                    Text("virtio").tag("virtio")
+                }
+                Text("Automatic uses Legacy PC for images that only boot with BIOS, such as DOS, Windows 9x and XP.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Architecture & Firmware")
             }
