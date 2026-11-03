@@ -104,6 +104,9 @@ do {
     case "disc":
         expectArgs((1...2).contains(nargs), "crab disc NAME [IMAGE|eject]")
         try cmdDisc(paths, first!, nargs > 1 ? positional[1] : nil)
+    case "key":
+        expectArgs(nargs >= 2, "crab key NAME KEY...")
+        try cmdKey(paths, first!, Array(positional.dropFirst()))
     case "ssh":
         expectArgs(nargs > 0, "crab ssh [USER@]NAME [-- COMMAND...]")
         try cmdSSH(paths, first!, Array(positional.dropFirst()))

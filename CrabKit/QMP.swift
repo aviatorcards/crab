@@ -80,6 +80,12 @@ public enum QMP {
         }
     }
 
+    /// Presses `keys` (QEMU qcodes, e.g. ["ctrl", "alt", "delete"]) together,
+    /// then releases them, as a real keyboard would.
+    public static func sendKeys(_ vmDir: URL, _ keys: [String]) throws(CrabError) {
+        _ = try execute(vmDir, "send-key", arguments: ["keys": keys.map { ["type": "qcode", "data": $0] }])
+    }
+
     /// Tells QEMU to exit right away, like pulling the plug.
     public static func quit(_ vmDir: URL) throws(CrabError) {
         do {

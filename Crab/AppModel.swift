@@ -479,6 +479,18 @@ final class AppModel {
         }
     }
 
+    /// Presses a key combination (e.g. "f8", "ctrl-alt-delete") in a running VM.
+    func sendKey(_ dir: URL, name: String, combo: String, label: String) {
+        vmOp(name, pending: "Sending \(label) to '\(name)'...") { _ in
+            do throws(CrabError) {
+                _ = try CrabKit.sendKeys(dir, [combo])
+                return "Sent \(label) to '\(name)'."
+            } catch {
+                return "Couldn't send \(label): \(error.message)"
+            }
+        }
+    }
+
     /// Forces off a throwaway VM; its keep-or-discard prompt follows as usual.
     func forceOffThrowaway(_ vm: SpawnedVM) {
         guard let dir = vm.scratchDir else { return }

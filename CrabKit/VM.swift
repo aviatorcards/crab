@@ -470,14 +470,21 @@ public func changeDisc(_ dir: URL, to image: URL?) throws(CrabError) -> String {
     return "Ejected \(drive.image?.lastPathComponent ?? "the disc") from \(name)."
 }
 
-private func runningCDDrive(_ dir: URL) throws(CrabError) -> QMP.CDDrive {
+/// Checks the VM is running with a control socket, for `doing` (e.g. "its
+/// disc can't be changed") to explain what's out of reach without one.
+private func requireControlSocket(_ dir: URL, _ doing: String) throws(CrabError) {
     let name = dirName(dir)
     if vmPID(dir) == nil {
         throw CrabError("\(name) isn't running")
     }
     if !QMP.socketPath(dir).exists {
-        throw CrabError("\(name) was booted without a control socket, so its disc can't be changed")
+        throw CrabError("\(name) was booted without a control socket, so \(doing)")
     }
+}
+
+private func runningCDDrive(_ dir: URL) throws(CrabError) -> QMP.CDDrive {
+    let name = dirName(dir)
+    try requireControlSocket(dir, "its disc can't be changed")
     do throws(CrabError) {
         return try QMP.cdDrive(dir)
     } catch where error.message.hasSuffix("has no CD drive") {
@@ -485,6 +492,56 @@ private func runningCDDrive(_ dir: URL) throws(CrabError) -> QMP.CDDrive {
     } catch {
         throw error
     }
+}
+
+/// QEMU key names (qcodes) `crab key` accepts, beyond letters and digits.
+private let namedKeys = Set([
+    "ctrl", "ctrl_r", "alt", "alt_r", "shift", "shift_r", "meta_l", "meta_r", "menu",
+    "esc", "ret", "tab", "spc", "backspace", "delete", "insert", "home", "end", "pgup", "pgdn",
+    "up", "down", "left", "right", "caps_lock", "num_lock", "scroll_lock", "print", "sysrq", "pause",
+    "minus", "equal", "bracket_left", "bracket_right", "semicolon", "apostrophe", "grave_accent",
+    "backslash", "comma", "dot", "slash",
+]).union((1...12).map { "f\($0)" })
+
+/// Friendlier spellings for QEMU's key names.
+private let keyAliases = [
+    "control": "ctrl", "option": "alt", "opt": "alt", "cmd": "meta_l", "command": "meta_l", "win": "meta_l",
+    "super": "meta_l", "escape": "esc", "enter": "ret", "return": "ret", "space": "spc", "del": "delete",
+    "bksp": "backspace", "ins": "insert", "pageup": "pgup", "pagedown": "pgdn", "prtsc": "print",
+]
+
+/// Parses a key combination like "f8", "ctrl-alt-delete" or "Ctrl+Alt+Del"
+/// into QEMU key names (qcodes), pressed together.
+public func parseKeyCombo(_ combo: String) throws(CrabError) -> [String] {
+    let parts = combo.lowercased().split { $0 == "-" || $0 == "+" }.map(String.init)
+    if parts.isEmpty {
+        throw CrabError("no key given")
+    }
+    return try parts.map { (part: String) throws(CrabError) -> String in
+        let key = keyAliases[part] ?? part
+        let single = key.count == 1 && key.first!.isASCII && (key.first!.isLetter || key.first!.isNumber)
+        guard single || namedKeys.contains(key) else {
+            throw CrabError("unknown key '\(part)' (try f1-f12, esc, ret, tab, ctrl, alt, shift, delete, a letter or a digit)")
+        }
+        return key
+    }
+}
+
+/// Presses each of `combos` in turn in a running VM: for keys the Mac can't
+/// send to the guest, like Touch Bar function keys or Ctrl+Alt+Del.
+/// Returns a message saying what was sent.
+public func sendKeys(_ dir: URL, _ combos: [String]) throws(CrabError) -> String {
+    let parsed = try combos.map { (c: String) throws(CrabError) in try parseKeyCombo(c) }
+    try requireControlSocket(dir, "keys can't be sent to it")
+    for keys in parsed {
+        try QMP.sendKeys(dir, keys)
+    }
+    return "Sent \(combos.joined(separator: ", ")) to \(dirName(dir))."
+}
+
+/// `crab key NAME KEY...`.
+public func cmdKey(_ paths: Paths, _ name: String, _ combos: [String]) throws(CrabError) {
+    print(try sendKeys(try vmPath(paths, name), combos))
 }
 
 /// `crab disc NAME [IMAGE|eject]`. A bare file name is looked for in the

@@ -111,6 +111,8 @@ private struct ThrowawayRow: View {
                     .controlSize(.small)
             }
             if let dir = vm.scratchDir {
+                SendKeyMenu(dir: dir, name: vm.defaultName)
+                    .disabled(busy)
                 ChangeDiscMenu(dir: dir, name: vm.defaultName)
                     .disabled(busy)
             }
@@ -118,6 +120,43 @@ private struct ThrowawayRow: View {
                 .disabled(busy)
         }
         .padding(.vertical, 6)
+    }
+}
+
+/// Presses keys the Mac can't easily send to a guest: function keys on
+/// Touch Bar Macs, and combinations macOS keeps for itself.
+struct SendKeyMenu: View {
+    @Environment(AppModel.self) private var model
+    let dir: URL
+    let name: String
+
+    var body: some View {
+        Menu("Send Key") {
+            key("Ctrl+Alt+Delete", "ctrl-alt-delete")
+            key("Esc", "esc")
+            key("Return", "ret")
+            Divider()
+            Section("Function keys") {
+                ForEach(1...12, id: \.self) { n in
+                    key("F\(n)", "f\(n)")
+                }
+            }
+            Divider()
+            Menu("More") {
+                key("Alt+F4", "alt-f4")
+                key("Ctrl+Alt+F1", "ctrl-alt-f1")
+                key("Ctrl+Alt+F2", "ctrl-alt-f2")
+                key("Ctrl+Alt+F7", "ctrl-alt-f7")
+                key("Ctrl+Alt+Backspace", "ctrl-alt-backspace")
+                key("Print Screen", "print")
+            }
+        }
+        .fixedSize()
+        .help("Press keys in the VM that the Mac can't send, like Touch Bar function keys or Ctrl+Alt+Delete")
+    }
+
+    private func key(_ label: String, _ combo: String) -> some View {
+        Button(label) { model.sendKey(dir, name: name, combo: combo, label: label) }
     }
 }
 
@@ -193,6 +232,8 @@ private struct VMRow: View {
                     .controlSize(.small)
             }
             if running {
+                SendKeyMenu(dir: vm.dir, name: vm.name)
+                    .disabled(busy)
                 ChangeDiscMenu(dir: vm.dir, name: vm.name)
                     .disabled(busy)
                 Button("Shut Down") { model.stopVM(vm.name) }

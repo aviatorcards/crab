@@ -32,7 +32,7 @@ Managed via XcodeGen (`project.yml`), producing `Crab.xcodeproj` with four targe
   - `Catalog.swift`: release catalog sync for Fedora, Ubuntu, Alpine and OpenBSD from official indexes, mirror rules (built-in or `~/VMs/mirrors` with auto-probing), RSS release feeds, and resumable `.part` downloads with SHA-256 verification.
   - `Config.swift`: `Paths` (on-disk locations derived from `VM_ROOT`, default `~/VMs`), default constants, validators (`validMem` etc.), `Forward` port-forward type, and shared helpers.
   - `Process.swift`: process execution helpers, finding executables, and child process management.
-  - `QMP.swift`: synchronous QMP client for `<vm>/qmp.sock` (`queryStatus`, `systemPowerdown`, `quit`, `cdDrive`/`changeMedium` for disc swaps). macOS caps socket paths at 104 bytes, so `usableSocketPath` returns nil for long paths and those VMs boot without a socket.
+  - `QMP.swift`: synchronous QMP client for `<vm>/qmp.sock` (`queryStatus`, `systemPowerdown`, `quit`, `cdDrive`/`changeMedium` for disc swaps, `sendKeys`). macOS caps socket paths at 104 bytes, so `usableSocketPath` returns nil for long paths and those VMs boot without a socket.
   - `VM.swift`: saved-VM bookkeeping (`confGet`/`confSet`, inspecting/listing VMs, snapshots, resize, stop/kill, set, clone/rename, ssh).
 - **`crab`**: the command-line executable (`crab/main.swift`).
 - **`Crab`**: SwiftUI macOS application (`CrabApp.swift`, `ContentView.swift`, `AppModel.swift`, `VMListView.swift`, `ImageListView.swift`, `ReleasesView.swift`, `MirrorsView.swift`, `LaunchSettingsView.swift`, `ThrowawaySheet.swift`). Embeds the `crab` binary in `Contents/Helpers/crab`.

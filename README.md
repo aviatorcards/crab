@@ -50,7 +50,7 @@ New VMs get an SSH forward on the first free port from 2222 up (`-p PORT` picks 
 
 ### Control Socket
 
-Every VM crab boots gets a QMP control socket at `~/VMs/<name>/qmp.sock`. `crab stop`, `crab kill`, `crab disc`, the live state in `crab list` (`running`, `paused`, `shutdown`, …) and the app's Shut Down / Force Off / Change Disc controls use it. VMs booted by `vmboot` don't have one; `crab kill` still works for them.
+Every VM crab boots gets a QMP control socket at `~/VMs/<name>/qmp.sock`. `crab stop`, `crab kill`, `crab disc`, `crab key`, the live state in `crab list` (`running`, `paused`, `shutdown`, …) and the app's Shut Down / Force Off / Change Disc / Send Key controls use it. VMs booted by `vmboot` don't have one; `crab kill` still works for them.
 
 ## Requirements
 
@@ -138,6 +138,7 @@ crab stop openbsd             # press the power button and wait (offers to force
 crab kill openbsd             # force it off now
 crab disc panther "Apple Mac OS X 10.3.0 - Disk 2.iso"   # swap the CD in a running VM (for multi-disc installers)
 crab disc panther eject       # empty its CD drive
+crab key w2k f8               # press keys in a running VM (Touch Bar F-keys, ctrl-alt-delete, ...)
 crab ssh openbsd              # ssh in through the VM's forwarded port
 crab ssh root@openbsd -- uname -a
 crab set openbsd              # show saved settings

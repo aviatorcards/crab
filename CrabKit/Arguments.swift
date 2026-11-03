@@ -2,7 +2,7 @@ import Foundation
 
 public let commands = [
     "boot", "get", "sync", "list", "images", "clean", "delete", "snapshot", "snapshots", "restore",
-    "delsnap", "mirrors", "dir", "stop", "kill", "ssh", "set", "clone", "rename", "resize", "disc",
+    "delsnap", "mirrors", "dir", "stop", "kill", "ssh", "set", "clone", "rename", "resize", "disc", "key",
 ]
 
 public struct CLI: Sendable, Equatable {
@@ -146,6 +146,9 @@ public func usageText(_ paths: Paths) -> String {
            crab kill NAME               force a running VM off
            crab disc NAME [IMAGE|eject] show, change or eject a running VM's CD
                                         (IMAGE may be a file name in the search folder)
+           crab key NAME KEY...         press keys in a running VM, e.g. f8 or
+                                        ctrl-alt-delete (for Touch Bar Macs and
+                                        keys macOS keeps for itself)
            crab ssh [USER@]NAME [-- COMMAND...]
                                         ssh into a running VM through its forwarded port
            crab list                    list saved VMs

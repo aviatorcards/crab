@@ -66,6 +66,39 @@ struct QMPTests {
         #expect(ejected.all.first?.contains(#""execute":"eject""#) == true)
     }
 
+    @Test func sendsKeysPressedTogether() throws {
+        let dir = testDir("qmp-keys")
+        let received = Box<String>()
+        fakeQEMU(dir, reply: #"{"return": {}}"#, received: received)
+        try QMP.sendKeys(dir, ["ctrl", "alt", "delete"])
+        let sent = try #require(received.all.first)
+        #expect(sent.contains(#""execute":"send-key""#))
+        #expect(sent.contains(#"{"data":"ctrl","type":"qcode"}"#) || sent.contains(#"{"type":"qcode","data":"ctrl"}"#))
+        #expect(sent.range(of: "ctrl")!.lowerBound < sent.range(of: "delete")!.lowerBound, "keys keep their order")
+    }
+
+    @Test func keyCombos() throws {
+        #expect(try parseKeyCombo("f8") == ["f8"])
+        #expect(try parseKeyCombo("ctrl-alt-delete") == ["ctrl", "alt", "delete"])
+        #expect(try parseKeyCombo("Ctrl+Alt+Del") == ["ctrl", "alt", "delete"])
+        #expect(try parseKeyCombo("enter") == ["ret"])
+        #expect(try parseKeyCombo("cmd-space") == ["meta_l", "spc"])
+        #expect(try parseKeyCombo("shift-a") == ["shift", "a"])
+        #expect(try parseKeyCombo("F12") == ["f12"])
+        #expect(throws: CrabError.self) { try parseKeyCombo("f13") }
+        #expect(throws: CrabError.self) { try parseKeyCombo("ctrl-bogus") }
+        #expect(throws: CrabError.self) { try parseKeyCombo("") }
+    }
+
+    @Test func keysNeedARunningVM() throws {
+        let root = testDir("keys-stopped")
+        makeVM(root, "w2k", conf: "arch=i386\n")
+        #expect(throws: CrabError("w2k isn't running")) { try cmdKey(Paths(root: root), "w2k", ["f8"]) }
+        #expect(throws: CrabError.self, "bad keys are caught before anything is sent") {
+            try cmdKey(Paths(root: root), "w2k", ["f8", "nope"])
+        }
+    }
+
     @Test func discChangesNeedARunningVM() throws {
         let root = testDir("disc-stopped")
         makeVM(root, "panther", conf: "arch=ppc\n")
