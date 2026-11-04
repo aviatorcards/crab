@@ -311,7 +311,7 @@ final class AppModel {
         opts.live = live
         opts.mem = mem
         opts.cpus = cpus
-        opts.diskSize = diskSize
+        opts.diskSize = effectiveDiskSize
         let port = sshPort.trimmingCharacters(in: .whitespaces)
         opts.sshPort = port.isEmpty ? nil : port
         // Keep each VM's saved port forwards and display; the app opens a window regardless.
@@ -325,11 +325,19 @@ final class AppModel {
         return opts
     }
 
+    /// The New Disk field as qemu-img wants it: blank means the default and a
+    /// bare number means gigabytes, like the RAM field.
+    private var effectiveDiskSize: String {
+        let s = diskSize.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { return defaultDiskSize }
+        return s.allSatisfy({ $0.isASCII && $0.isNumber }) ? s + "G" : s
+    }
+
     /// Checks the launch settings the way the CLI checks its flags.
     private func launchSettingsError() -> String? {
         if !validMem(mem) { return "RAM wants a size like 2G or 512M." }
         if !validCPUs(cpus) { return "CPUs wants a number." }
-        if !validDiskSize(diskSize, relative: false) { return "New Disk wants a size like 20G." }
+        if !validDiskSize(effectiveDiskSize, relative: false) { return "New Disk wants a size like 20G." }
         let port = sshPort.trimmingCharacters(in: .whitespaces)
         if !port.isEmpty && !validPort(port) { return "SSH Port wants a port number, or blank." }
         return nil
