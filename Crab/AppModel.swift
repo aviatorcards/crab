@@ -61,11 +61,11 @@ struct ThrowawayPrompt: Identifiable {
     let imagePath: URL?
     var name: String
     let diskSizeHuman: String
-    let diskUsedKB: Int
     let live: Bool
 
-    /// Whether enough was written to the disk to be worth keeping.
-    var canKeep: Bool { !live && diskUsedKB >= 1024 }
+    /// Live boots have no disk. Every other throwaway can be kept; the size
+    /// shown next to it is information, not a reason to throw the disk away.
+    var canKeep: Bool { throwawayShouldOfferKeep(live: live) }
 }
 
 /// The release download in progress.
@@ -436,17 +436,15 @@ final class AppModel {
 
     private func throwawayExited(_ info: ThrowawayInfo) {
         reload()
+        // Mark the on-disk session before showing the prompt, so a clean
+        // that races this (or a crash while the sheet is up) still sees it
+        // as recoverable. The marker is removed only after Keep or Discard works.
+        markThrowawayPending(info.dir)
         let scratch = info.dir
         let disk = scratch.appending(path: "disk.qcow2")
-        let usedKB = info.live ? 0 : diskKB(disk)
-        if !info.live && usedKB < 1024 && info.imagePath == nil {
-            try? FileManager.default.removeItem(at: scratch)
-            status = "Throwaway VM exited with nothing written to its disk, so it was discarded."
-            return
-        }
         throwawayPrompts.append(ThrowawayPrompt(
             scratchDir: scratch, imagePath: info.imagePath, name: info.defaultName,
-            diskSizeHuman: humanSize(disk), diskUsedKB: usedKB, live: info.live
+            diskSizeHuman: humanSize(disk), live: info.live
         ))
     }
 
@@ -465,13 +463,12 @@ final class AppModel {
             status = "There's already a VM called '\(name)'."
             return false
         }
-        try? FileManager.default.removeItem(at: prompt.scratchDir.appending(path: "qemu.pid"))
-        try? FileManager.default.removeItem(at: QMP.socketPath(prompt.scratchDir))
-        try? FileManager.default.removeItem(at: throwawayInfoFile(prompt.scratchDir))
         do {
-            try FileManager.default.moveItem(at: prompt.scratchDir, to: dest)
+            try keepScratchVM(prompt.scratchDir, to: dest)
         } catch {
-            status = "Couldn't save the VM: \(error.localizedDescription)"
+            // The prompt and the gui-session marker both stay, so the VM can
+            // be kept or adopted again. keepScratchVM does not delete on failure.
+            status = error.message
             return false
         }
         status = "Kept the throwaway VM as '\(name)'."
@@ -481,11 +478,23 @@ final class AppModel {
     }
 
     func discardThrowaway(_ prompt: ThrowawayPrompt, deleteImage: Bool) {
-        try? FileManager.default.trashItem(at: prompt.scratchDir, resultingItemURL: nil)
-        status = "Throwaway VM trashed."
-        if deleteImage, let img = prompt.imagePath, (try? FileManager.default.trashItem(at: img, resultingItemURL: nil)) != nil {
-            status = "Throwaway VM and image '\(img.lastPathComponent)' trashed."
+        do {
+            try discardScratch(prompt.scratchDir, how: .trash)
+        } catch {
+            // Leave the prompt and the marker until the directory is actually gone.
+            status = error.message
+            return
         }
+        var message = "Throwaway VM trashed."
+        if deleteImage, let img = prompt.imagePath {
+            do {
+                try trashImageEntry(img)
+                message = "Throwaway VM and image '\(img.lastPathComponent)' trashed."
+            } catch {
+                message = "Trashed the VM, but couldn't trash the image '\(img.lastPathComponent)': \(error.localizedDescription)"
+            }
+        }
+        status = message
         throwawayPrompts.removeAll { $0.id == prompt.id }
         reload()
     }
@@ -608,8 +617,13 @@ final class AppModel {
     func cleanScratch() {
         status = "Cleaning leftover throwaway VMs..."
         let paths = paths
+        let protected = Set(
+            throwawayPrompts.map(\.scratchDir) + sessions.values.compactMap(\.scratchDir) + Array(adopted.keys)
+        )
         Task {
-            let (n, kb) = await Task.detached { cleanLeftoverScratch(paths) }.value
+            let (n, kb) = await Task.detached {
+                cleanLeftoverScratch(paths, preserving: protected)
+            }.value
             status = "Cleaned \(n) leftover throwaway VM(s), freed \(fmtKB(kb))."
             reload()
         }
@@ -619,7 +633,7 @@ final class AppModel {
 
     func deleteImage(_ url: URL) {
         do {
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            try trashImageEntry(url)
             status = "Trashed image '\(url.lastPathComponent)'."
         } catch {
             status = "Couldn't delete '\(url.lastPathComponent)': \(error.localizedDescription)"
