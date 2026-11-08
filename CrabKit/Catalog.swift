@@ -9,9 +9,11 @@ public struct CatalogEntry: Sendable, Hashable, Identifiable {
     public var url: String
     public var sha256: String
     public var display: String
+    /// SHA-1, for releases that publish that instead of SHA-256 (Apple's IPSWs).
+    public var sha1: String
     public var id: String { "\(distro)/\(variant)/\(arch)/\(version)" }
 
-    public init(distro: String, variant: String, version: String, arch: String, url: String, sha256: String, display: String) {
+    public init(distro: String, variant: String, version: String, arch: String, url: String, sha256: String, display: String, sha1: String = "") {
         self.distro = distro
         self.variant = variant
         self.version = version
@@ -19,10 +21,11 @@ public struct CatalogEntry: Sendable, Hashable, Identifiable {
         self.url = url
         self.sha256 = sha256
         self.display = display
+        self.sha1 = sha1
     }
 
     public var tsvLine: String {
-        [distro, variant, version, arch, url, sha256, display].joined(separator: "\t")
+        [distro, variant, version, arch, url, sha256, display, sha1].joined(separator: "\t")
     }
 
     public init?(tsvLine line: String) {
@@ -30,7 +33,8 @@ public struct CatalogEntry: Sendable, Hashable, Identifiable {
         guard parts.count >= 6 else { return nil }
         self.init(
             distro: parts[0], variant: parts[1], version: parts[2], arch: parts[3], url: parts[4],
-            sha256: parts[5], display: parts.count > 6 ? parts[6] : ""
+            sha256: parts[5], display: parts.count > 6 ? parts[6] : "",
+            sha1: parts.count > 7 ? parts[7] : ""
         )
     }
 }
@@ -594,7 +598,17 @@ public struct DistroSource: Sendable {
 }
 
 /// The distros in the catalog, in the order they're listed.
+func syncMacOS() async throws(CrabError) -> [CatalogEntry] {
+    let text = try await fetchText(macosIPSWCatalogURL)
+    let assets = parseMacOSIPSWCatalog(Data(text.utf8))
+    if assets.isEmpty {
+        throw CrabError("Apple's restore feed had no image for \(macosVirtualMachineModel)")
+    }
+    return macOSCatalogEntries(assets)
+}
+
 public let distroSources: [DistroSource] = [
+    DistroSource(name: macosDistro, displayName: "macOS", defaultVariant: macosVariant, sync: syncMacOS),
     DistroSource(name: "fedora", displayName: "Fedora", defaultVariant: "workstation", sync: syncFedora),
     DistroSource(name: "ubuntu", displayName: "Ubuntu", defaultVariant: "desktop", sync: syncUbuntu),
     DistroSource(name: "debian", displayName: "Debian", defaultVariant: "netinst", sync: syncDebian),
@@ -696,6 +710,11 @@ func packing(_ url: String) -> String? {
 /// The local file name for a download: the URL's, without any `.gz`/`.zst`
 /// (it's unpacked), and with the distro and arch added if they aren't in it already.
 public func getFilename(distro: String, arch: String, url: String) -> String {
+    // Keep Apple's own name (UniversalMac_15.2_24C101_Restore.ipsw). The file
+    // is an installer, not a disk image, and the name already says what it is.
+    if distro == macosDistro {
+        return url.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? "macOS.ipsw"
+    }
     var file = url.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? "image.iso"
     if let ext = packing(file) {
         file = String(file.dropLast(ext.count + 1))
@@ -982,9 +1001,13 @@ public func sourcesFor(_ paths: Paths, _ url: String) -> [String] {
 }
 
 public func sha256OfFile(_ url: URL) throws -> String {
+    try hashFile(url, SHA256())
+}
+
+func hashFile<H: HashFunction>(_ url: URL, _ hasher: H) throws -> String {
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
-    var hasher = SHA256()
+    var hasher = hasher
     while let data = try handle.read(upToCount: 1024 * 1024), !data.isEmpty {
         hasher.update(data: data)
     }
@@ -1043,8 +1066,9 @@ public typealias DownloadReport = @Sendable (DownloadEvent) -> Void
 /// then `url`) that gives a file matching `sum`. A partial download is kept
 /// as `file.part` and resumed by the next source or the next attempt.
 /// Setting `cancel` stops it between chunks. A `.gz` or `.zst` release is
-/// checked as downloaded, then unpacked into `file`. An empty `sum` means
-/// the release has no published checksum, so the download isn't verified.
+/// checked as downloaded, then unpacked into `file`. An empty `sum` and
+/// `sha1` means the release has no published checksum, so the download isn't
+/// verified. macOS restore images pass Apple's SHA-1 in `sha1`.
 public func downloadImage(
     _ paths: Paths,
     url: String,
@@ -1052,13 +1076,14 @@ public func downloadImage(
     file: String,
     dryRun: Bool,
     cancel: CancelFlag,
-    report: DownloadReport
+    report: DownloadReport,
+    sha1: String = ""
 ) async throws(CrabError) -> URL {
     let dest = paths.searchDir.appending(path: file)
     let packed = packing(url)
 
     if dest.isFile {
-        if sum.isEmpty {
+        if sum.isEmpty && sha1.isEmpty {
             report(.note("Already downloaded: \(dest.path) (there's no published checksum to check it against)"))
             return dest
         }
@@ -1067,13 +1092,13 @@ public func downloadImage(
             report(.note("Already downloaded: \(dest.path) (unpacked from a download that matched the checksum)"))
             return dest
         }
-        let actual: String
+        let matches: Bool
         do {
-            actual = try sha256OfFile(dest)
+            matches = try fileMatchesChecksum(dest, sha256: sum, sha1: sha1)
         } catch {
             throw CrabError(error.localizedDescription)
         }
-        if actual.caseInsensitiveCompare(sum) == .orderedSame {
+        if matches {
             report(.note("Already downloaded: \(dest.path)"))
             return dest
         }
@@ -1098,7 +1123,7 @@ public func downloadImage(
         throw CrabError(error.localizedDescription)
     }
     guard let packed else {
-        return try await downloadFrom(sources, sha256: sum, dest: dest, limits: .standard, cancel: cancel, report: report)
+        return try await downloadFrom(sources, sha256: sum, sha1: sha1, dest: dest, limits: .standard, cancel: cancel, report: report)
     }
 
     let archive = paths.searchDir.appending(path: "\(file).\(packed)")
@@ -1107,7 +1132,7 @@ public func downloadImage(
         && (try? sha256OfFile(archive))?.caseInsensitiveCompare(sum) == .orderedSame
     if !haveArchive {
         try? FileManager.default.removeItem(at: archive)
-        _ = try await downloadFrom(sources, sha256: sum, dest: archive, limits: .standard, cancel: cancel, report: report)
+        _ = try await downloadFrom(sources, sha256: sum, sha1: sha1, dest: archive, limits: .standard, cancel: cancel, report: report)
     }
     try unpack(archive, packed, to: dest, report: report)
     return dest
@@ -1141,9 +1166,20 @@ func unpack(_ archive: URL, _ packing: String, to dest: URL, report: DownloadRep
     report(.note("Unpacked: \(dest.path)"))
 }
 
+func fileMatchesChecksum(_ url: URL, sha256: String, sha1: String) throws -> Bool {
+    if !sha256.isEmpty {
+        return try sha256OfFile(url).caseInsensitiveCompare(sha256) == .orderedSame
+    }
+    if !sha1.isEmpty {
+        return try sha1OfFile(url).caseInsensitiveCompare(sha1) == .orderedSame
+    }
+    return true
+}
+
 func downloadFrom(
     _ sources: [String],
     sha256 sum: String,
+    sha1: String = "",
     dest: URL,
     limits: StallLimits,
     cancel: CancelFlag,
@@ -1172,7 +1208,7 @@ func downloadFrom(
         }
 
         guard part.isFile else { continue }
-        if sum.isEmpty {
+        if sum.isEmpty && sha1.isEmpty {
             // Nothing to check it against, so take any complete download.
             guard complete else { continue }
             do {
@@ -1183,7 +1219,7 @@ func downloadFrom(
             report(.note("Downloaded \(dest.path) (there's no published checksum, so it isn't verified)"))
             return dest
         }
-        if let actual = try? sha256OfFile(part), actual.caseInsensitiveCompare(sum) == .orderedSame {
+        if (try? fileMatchesChecksum(part, sha256: sum, sha1: sha1)) == true {
             do {
                 try FileManager.default.moveItem(at: part, to: dest)
             } catch {
@@ -1399,7 +1435,7 @@ public func cmdGetList(_ paths: Paths, arch: String) {
         if entry.variant == defaultVariant(entry.distro) {
             marks.append("default")
         }
-        if entry.sha256.isEmpty {
+        if entry.sha256.isEmpty && entry.sha1.isEmpty {
             marks.append("unverified")
         }
         let markStr = marks.isEmpty ? "" : "(\(marks.joined(separator: ", ")))"
@@ -1409,6 +1445,11 @@ public func cmdGetList(_ paths: Paths, arch: String) {
 
 public func cmdGet(_ paths: Paths, _ opts: BootOptions, spec: String?) async throws(CrabError) {
     let arch = opts.arch.flatMap { $0.isEmpty ? nil : $0 } ?? hostArch()
+    // Refuse before refreshing the whole catalog: an Intel Mac can't install it.
+    if spec?.split(separator: "/").first?.lowercased() == macosDistro,
+       let reason = macosGuestRefusal(hostArchitecture: hostArch()) {
+        throw CrabError(reason)
+    }
     try await ensureCatalog(paths)
 
     guard let spec, !spec.isEmpty else {
@@ -1430,6 +1471,10 @@ public func cmdGet(_ paths: Paths, _ opts: BootOptions, spec: String?) async thr
         throw CrabError("don't know how to get '\(distro)' (I know: \(distros.joined(separator: " ")))")
     }
     let variant = variantOpt ?? defaultVariant(distro)
+    if distro == macosDistro {
+        try await cmdGetMacOS(paths, opts, variant: variant)
+        return
+    }
 
     let catalog = loadCatalog(paths)
     guard let entry = catalog.first(where: { $0.distro == distro && $0.variant == variant && $0.arch == arch }) else {
@@ -1445,7 +1490,7 @@ public func cmdGet(_ paths: Paths, _ opts: BootOptions, spec: String?) async thr
 
     let imagePath = try await downloadImage(
         paths, url: entry.url, sha256: entry.sha256, file: file, dryRun: opts.dryRun,
-        cancel: CancelFlag(), report: terminalReport()
+        cancel: CancelFlag(), report: terminalReport(), sha1: entry.sha1
     )
     if opts.downloadOnly {
         return

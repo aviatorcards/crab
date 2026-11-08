@@ -30,7 +30,9 @@ struct LaunchSettingsView: View {
                 TextField("CPUs", text: $model.cpus, prompt: Text(String(defaultCPUs)))
                 TextField("New disk", text: $model.diskSize, prompt: Text(defaultDiskSize))
                 TextField("SSH port", text: $model.sshPort, prompt: Text("Pick one"))
-                    .help("Forward localhost:PORT to the guest's SSH; blank picks a free port for new VMs")
+                    .help("Forward localhost:PORT to the guest's SSH; blank picks a free port for new VMs. macOS guests don't get a forward.")
+            } footer: {
+                Text("macOS guests need at least \(defaultMacOSMem) of RAM and a \(defaultMacOSDisk) disk. Smaller settings are raised to that.")
             }
 
             Section("Firmware & Display") {

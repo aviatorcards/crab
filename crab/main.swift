@@ -1,8 +1,6 @@
 import CrabKit
 import Foundation
 
-let appBundleID = "com.tristansmith.Crab"
-
 func die(_ msg: String) -> Never {
     FileHandle.standardError.write(Data("crab: \(msg)\n".utf8))
     exit(1)
@@ -16,33 +14,8 @@ func badUsage(_ msg: String) -> Never {
 /// Opens the Crab app, passing along VM_ROOT / CRAB_SEARCH_DIR and the boot flags.
 /// Prefers the app this binary is bundled in (Crab.app/Contents/Helpers/crab).
 func launchGUI(_ rawArgs: [String]) throws(CrabError) {
-    var openArgs: [String] = []
-    let me = URL(filePath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    let bundle = me.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    if bundle.pathExtension == "app" {
-        openArgs += ["-a", bundle.path]
-    } else {
-        openArgs += ["-b", appBundleID]
-    }
-    let env = ProcessInfo.processInfo.environment
-    for key in ["VM_ROOT", "CRAB_SEARCH_DIR"] {
-        if let value = env[key], !value.isEmpty {
-            openArgs += ["--env", "\(key)=\(value)"]
-        }
-    }
     let flags = rawArgs.filter { $0 != "gui" && $0 != "--gui" }
-    if !flags.isEmpty {
-        openArgs += ["--args"] + flags
-    }
-    let status: Int32
-    do {
-        status = try runInheriting(URL(filePath: "/usr/bin/open"), openArgs)
-    } catch {
-        throw CrabError("failed to run open: \(error.localizedDescription)")
-    }
-    if status != 0 {
-        throw CrabError("couldn't open the Crab app; build and install it from Crab.xcodeproj")
-    }
+    try openCrabApp(arguments: flags)
 }
 
 func isRegularFile(_ path: String) -> Bool {

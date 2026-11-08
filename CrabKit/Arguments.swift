@@ -170,6 +170,12 @@ public func usageText(_ paths: Paths) -> String {
     it, and if not, its disk is deleted. crab boots arm64, x86 (amd64, i386),
     PowerPC Mac (ppc: Mac OS 9, Mac OS X up to 10.5) and SPARC64 (sparc64: Sun Ultra 5) guests.
 
+    macOS (Apple Silicon only): crab get macos downloads Apple's latest restore
+    image and opens Crab to install it with Virtualization.framework. Those VMs
+    live in the same folder as QEMU VMs (Disk.img, not disk.qcow2). They have no
+    snapshots and no SSH port forward. QEMU can't run current macOS, and neither
+    can an Intel Mac.
+
     Boot options:
       -s DIR    where to look for (and download) .iso/.img files (default: ~/Downloads)
       -a ARCH   with get: arm64 or amd64 (default: this Mac's)

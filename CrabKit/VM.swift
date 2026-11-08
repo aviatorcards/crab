@@ -22,7 +22,27 @@ public struct VMEntry: Sendable, Hashable, Identifiable {
     /// "stopped", or QEMU's run state: "running", "paused", "shutdown", ...
     public var state: String
     public var lastUsedSecs: Int
+    /// `qemu` for a QEMU VM, `vz` for a macOS guest on Virtualization.framework.
+    public var backend: String
     public var id: String { name }
+}
+
+/// A macOS guest: `Disk.img` with `backend=vz`, or `Disk.img` plus a hardware
+/// model and no QEMU disk. A plain `disk.qcow2` VM is never treated as one.
+public func isMacOSVM(_ dir: URL) -> Bool {
+    guard dir.appending(path: MacOSVMLayout.diskName).isFile else { return false }
+    if confGet(dir, "backend") == vmBackendVZ { return true }
+    if dir.appending(path: "disk.qcow2").isFile { return false }
+    return dir.appending(path: MacOSVMLayout.hardwareModelName).isFile
+}
+
+public func isVMDirectory(_ dir: URL) -> Bool {
+    dir.appending(path: "disk.qcow2").isFile || isMacOSVM(dir)
+}
+
+public func vmDiskURL(_ dir: URL) -> URL {
+    if isMacOSVM(dir) { return dir.appending(path: MacOSVMLayout.diskName) }
+    return dir.appending(path: "disk.qcow2")
 }
 
 public func confGet(_ dir: URL, _ key: String) -> String {
@@ -93,7 +113,7 @@ public func checkName(_ name: String) throws(CrabError) {
 public func vmPath(_ paths: Paths, _ name: String) throws(CrabError) -> URL {
     try checkName(name)
     let dir = paths.vmRoot.appending(path: name, directoryHint: .isDirectory)
-    if !dir.appending(path: "disk.qcow2").isFile {
+    if !isVMDirectory(dir) {
         throw CrabError("no VM named '\(name)' in \(paths.vmRoot.path) (try: crab list)")
     }
     return dir
@@ -101,6 +121,9 @@ public func vmPath(_ paths: Paths, _ name: String) throws(CrabError) -> URL {
 
 /// The pid of the VM's QEMU process, if it's running.
 public func vmPID(_ dir: URL) -> Int32? {
+    if isMacOSVM(dir) {
+        return livePIDFile(dir.appending(path: MacOSVMLayout.pidName))
+    }
     guard let pidStr = try? String(contentsOf: dir.appending(path: "qemu.pid"), encoding: .utf8),
           let pid = Int32(pidStr.trimmed),
           let name = processName(pid), name.lowercased().contains("qemu") else {
@@ -119,7 +142,7 @@ public func requireStopped(_ dir: URL) throws(CrabError) {
 public func listVMDirs(_ paths: Paths) -> [URL] {
     let entries = (try? FileManager.default.contentsOfDirectory(at: paths.vmRoot, includingPropertiesForKeys: nil)) ?? []
     return entries
-        .filter { $0.isDirectory && !$0.lastPathComponent.hasPrefix(".") && $0.appending(path: "disk.qcow2").isFile }
+        .filter { $0.isDirectory && !$0.lastPathComponent.hasPrefix(".") && isVMDirectory($0) }
         .sorted { $0.path < $1.path }
 }
 
@@ -166,17 +189,28 @@ public func qemuImgSnapshots(_ disk: URL) -> [String] {
 }
 
 public func inspectVM(_ dir: URL) -> VMEntry {
-    let disk = dir.appending(path: "disk.qcow2")
+    let macos = isMacOSVM(dir)
+    let disk = vmDiskURL(dir)
     let mem = confGet(dir, "mem")
     let cpus = confGet(dir, "cpus")
+    let diskVirt: String
+    let snaps: Int
+    if macos {
+        let saved = confGet(dir, "disk")
+        diskVirt = saved.isEmpty ? formatDiskBytes(logicalFileBytes(disk)) : saved
+        snaps = 0
+    } else {
+        diskVirt = qemuImgVirtSize(disk)
+        snaps = qemuImgSnapshots(disk).count
+    }
     return VMEntry(
         name: dir.lastPathComponent,
         dir: dir,
         disk: disk,
         arch: confGet(dir, "arch"),
         firmware: confGet(dir, "firmware"),
-        mem: mem.isEmpty ? defaultMem : mem,
-        cpus: cpus.isEmpty ? String(defaultCPUs) : cpus,
+        mem: mem.isEmpty ? (macos ? defaultMacOSMem : defaultMem) : mem,
+        cpus: cpus.isEmpty ? String(macos ? defaultMacOSCPUs : defaultCPUs) : cpus,
         sshPort: confGet(dir, "ssh_port"),
         display: confGet(dir, "display"),
         hw: confGet(dir, "hw"),
@@ -185,11 +219,12 @@ public func inspectVM(_ dir: URL) -> VMEntry {
         sshUser: confGet(dir, "ssh_user"),
         forwards: confGet(dir, "fwd"),
         diskUsed: humanSize(disk),
-        diskVirt: qemuImgVirtSize(disk),
-        snapsCount: qemuImgSnapshots(disk).count,
+        diskVirt: diskVirt,
+        snapsCount: snaps,
         runningPID: vmPID(dir),
         state: vmState(dir) ?? "stopped",
-        lastUsedSecs: fileMtime(disk)
+        lastUsedSecs: fileMtime(disk),
+        backend: macos ? vmBackendVZ : vmBackendQEMU
     )
 }
 
@@ -210,15 +245,16 @@ public func cmdList(_ paths: Paths) {
     print(row(["NAME", "ARCH", "FW", "MEM", "CPUS", "SSH", "DISK", "SNAPS", "STATE", "LAST USED"]))
     for v in vms {
         let ssh = !v.sshPort.isEmpty && v.sshPort != "0" ? v.sshPort : "-"
+        let snaps = v.backend == vmBackendVZ ? "-" : String(v.snapsCount)
         print(row([v.name, v.arch, v.firmware, v.mem, v.cpus, ssh, "\(v.diskUsed) of \(v.diskVirt)",
-                   String(v.snapsCount), v.state, fmtAge(v.lastUsedSecs)]))
+                   snaps, v.state, fmtAge(v.lastUsedSecs)]))
     }
 }
 
 public func cmdImages(_ paths: Paths) {
     let images = listImageEntries(paths)
     if images.isEmpty {
-        print("No .iso/.img files in \(paths.searchDir.path)")
+        print("No .iso/.img/.ipsw files in \(paths.searchDir.path)")
         return
     }
     let w = max(5, images.map(\.name.count).max() ?? 5)
@@ -281,7 +317,7 @@ public func cmdClean(_ paths: Paths, days: Int) {
 
     if !quit {
         for d in listVMDirs(paths) {
-            let mtime = fileMtime(d.appending(path: "disk.qcow2"))
+            let mtime = fileMtime(vmDiskURL(d))
             if mtime >= cutoff || vmPID(d) != nil {
                 continue
             }
@@ -323,7 +359,11 @@ public func deleteVMDir(_ paths: Paths, _ name: String, toTrash: Bool = false) t
 public func cmdDelete(_ paths: Paths, _ name: String) throws(CrabError) {
     let dir = try vmPath(paths, name)
     try requireStopped(dir)
-    print("This deletes \(dir.path) (\(humanSize(dir))), including its disk and snapshots.")
+    if isMacOSVM(dir) {
+        print("This deletes \(dir.path) (\(humanSize(dir))), including its disk. macOS VMs don't have snapshots.")
+    } else {
+        print("This deletes \(dir.path) (\(humanSize(dir))), including its disk and snapshots.")
+    }
     let answer = promptLine("Type the VM name to confirm: ") ?? ""
     if answer.trimmed != name {
         throw CrabError("names don't match; nothing deleted")
@@ -341,6 +381,9 @@ private let snapshotTagFormatter: DateFormatter = {
 
 public func createSnapshot(_ paths: Paths, _ name: String, tag tagOpt: String?) throws(CrabError) -> String {
     let dir = try vmPath(paths, name)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. Apple's Virtualization framework has no disk snapshots, so crab snapshot doesn't apply. QEMU VMs still snapshot as before.")
+    }
     try needQemuImg()
     try requireStopped(dir)
     let tag = tagOpt.flatMap { $0.isEmpty ? nil : $0 } ?? snapshotTagFormatter.string(from: Date())
@@ -361,6 +404,9 @@ public func cmdSnapshot(_ paths: Paths, _ name: String, tag: String?) throws(Cra
 
 public func listSnapshotsRaw(_ paths: Paths, _ name: String) throws(CrabError) -> String {
     let dir = try vmPath(paths, name)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. Apple's Virtualization framework has no disk snapshots.")
+    }
     try needQemuImg()
     let out = try qemuImg(["snapshot", "-l", "-U", dir.appending(path: "disk.qcow2").path])
     return String(out.stdout.reversed().drop(while: \.isWhitespace).reversed())
@@ -373,6 +419,9 @@ public func cmdSnapshots(_ paths: Paths, _ name: String) throws(CrabError) {
 
 public func restoreSnapshot(_ paths: Paths, _ name: String, _ tag: String) throws(CrabError) {
     let dir = try vmPath(paths, name)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. Apple's Virtualization framework has no disk snapshots, so there's nothing to restore.")
+    }
     try needQemuImg()
     try requireStopped(dir)
     if !(try qemuImg(["snapshot", "-a", tag, dir.appending(path: "disk.qcow2").path])).success {
@@ -393,6 +442,9 @@ public func cmdRestore(_ paths: Paths, _ name: String, _ tag: String) throws(Cra
 
 public func deleteSnapshot(_ paths: Paths, _ name: String, _ tag: String) throws(CrabError) {
     let dir = try vmPath(paths, name)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. Apple's Virtualization framework has no disk snapshots.")
+    }
     try needQemuImg()
     try requireStopped(dir)
     if !(try qemuImg(["snapshot", "-d", tag, dir.appending(path: "disk.qcow2").path])).success {
@@ -409,6 +461,7 @@ public func cmdDelsnap(_ paths: Paths, _ name: String, _ tag: String) throws(Cra
 /// "running" for VMs booted without a control socket).
 public func vmState(_ dir: URL) -> String? {
     guard vmPID(dir) != nil else { return nil }
+    if isMacOSVM(dir) { return "running" }
     return QMP.queryStatus(dir) ?? "running"
 }
 
@@ -429,6 +482,10 @@ public func requestShutdown(_ dir: URL) throws(CrabError) {
     if vmPID(dir) == nil {
         throw CrabError("\(name) isn't running")
     }
+    if isMacOSVM(dir) {
+        try sendVZCommand(dir, "stop")
+        return
+    }
     if !QMP.socketPath(dir).exists {
         throw CrabError("\(name) was booted without a control socket (by vmboot or an older crab), so it can't be shut down cleanly; force it off with: crab kill \(name)")
     }
@@ -440,6 +497,20 @@ public func forceOff(_ dir: URL) throws(CrabError) {
     let name = dirName(dir)
     guard let pid = vmPID(dir) else {
         throw CrabError("\(name) isn't running")
+    }
+    if isMacOSVM(dir) {
+        // The pid belongs to Crab.app, which may be hosting other windows.
+        // Ask the guest to stop; don't signal the whole app.
+        if (try? sendVZCommand(dir, "quit")) == nil {
+            throw CrabError("\(name) is a macOS VM running inside Crab (pid \(pid)), and it isn't answering. Close its window, or quit Crab, to force it off.")
+        }
+        if !waitStopped(dir, timeout: 10) {
+            throw CrabError("\(name) is still running. Close its window in Crab, or quit Crab.")
+        }
+        let layout = MacOSVMLayout(directory: dir)
+        try? FileManager.default.removeItem(at: layout.pidFile)
+        try? FileManager.default.removeItem(at: layout.socket)
+        return
     }
     if (try? QMP.quit(dir)) == nil {
         kill(pid, SIGTERM)
@@ -458,6 +529,9 @@ public func forceOff(_ dir: URL) throws(CrabError) {
 /// nil. Returns a message saying what happened.
 public func changeDisc(_ dir: URL, to image: URL?) throws(CrabError) -> String {
     let name = dirName(dir)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. It has no CD drive to change; the restore image is only used while installing.")
+    }
     let drive = try runningCDDrive(dir)
     if let image {
         guard image.isFile else {
@@ -531,6 +605,9 @@ public func parseKeyCombo(_ combo: String) throws(CrabError) -> [String] {
 /// send to the guest, like Touch Bar function keys or Ctrl+Alt+Del.
 /// Returns a message saying what was sent.
 public func sendKeys(_ dir: URL, _ combos: [String]) throws(CrabError) -> String {
+    if isMacOSVM(dir) {
+        throw CrabError("\(dirName(dir)) is a macOS VM. Keys go to its window; crab key is for QEMU guests.")
+    }
     let parsed = try combos.map { (c: String) throws(CrabError) in try parseKeyCombo(c) }
     try requireControlSocket(dir, "keys can't be sent to it")
     for keys in parsed {
@@ -652,13 +729,19 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
 public func setSettings(_ paths: Paths, _ name: String, _ assignments: [String]) throws(CrabError) {
     let dir = try vmPath(paths, name)
     let arch = confGet(dir, "arch")
+    let macos = isMacOSVM(dir) ? MacOSVMConfig.load(dir) : nil
     var updates: [(String, String)] = []
     for a in assignments {
         guard let eq = a.firstIndex(of: "=") else {
             throw CrabError("'\(a)' should look like key=value")
         }
         let key = String(a[..<eq])
-        updates.append((key, try validateSetting(key, String(a[a.index(after: eq)...]), arch: arch)))
+        let value = String(a[a.index(after: eq)...])
+        if let macos {
+            updates.append((key, try validateMacOSSetting(key, value, config: macos)))
+        } else {
+            updates.append((key, try validateSetting(key, value, arch: arch)))
+        }
     }
     do {
         try confSet(dir, updates)
@@ -697,9 +780,10 @@ public func cloneVM(_ paths: Paths, _ src: String, _ dst: String) throws(CrabErr
     }
     do {
         // copyItem clones files on APFS, so this is quick and shares disk blocks.
-        for f in ["disk.qcow2", "efivars.fd", "vm.conf", "arch"] {
+        let names = isMacOSVM(srcDir) ? MacOSVMLayout.cloneNames : ["disk.qcow2", "efivars.fd", "vm.conf", "arch"]
+        for f in names {
             let from = srcDir.appending(path: f)
-            if from.isFile {
+            if from.exists {
                 try fm.copyItem(at: from, to: dstDir.appending(path: f))
             }
         }
@@ -719,6 +803,9 @@ public func cloneVM(_ paths: Paths, _ src: String, _ dst: String) throws(CrabErr
 public func cmdClone(_ paths: Paths, _ src: String, _ dst: String) throws(CrabError) {
     let dir = try cloneVM(paths, src, dst)
     print("Cloned \(src) to \(dst).")
+    if isMacOSVM(dir) {
+        print("Don't run \(src) and \(dst) at the same time: they share a machine identifier, and macOS VMs have no snapshots.")
+    }
     let port = confGet(dir, "ssh_port")
     if !port.isEmpty && port != "0" {
         print("\(dst) forwards SSH from port \(port).")
@@ -750,8 +837,22 @@ public func cmdRename(_ paths: Paths, _ old: String, _ new: String) throws(CrabE
 
 public func resizeDisk(_ paths: Paths, _ name: String, _ size: String) throws(CrabError) -> String {
     let dir = try vmPath(paths, name)
-    try needQemuImg()
     try requireStopped(dir)
+    if isMacOSVM(dir) {
+        let disk = vmDiskURL(dir)
+        guard let target = grownDiskBytes(current: logicalFileBytes(disk), spec: size) else {
+            throw CrabError("couldn't resize \(name)'s disk (disks can only grow; SIZE looks like 80G or +10G)")
+        }
+        try growRawDisk(disk, to: target)
+        let text = formatDiskBytes(target)
+        do {
+            try confSet(dir, [("disk", text)])
+        } catch {
+            throw CrabError("the disk grew, but vm.conf couldn't be updated: \(error.localizedDescription)")
+        }
+        return text
+    }
+    try needQemuImg()
     if !validDiskSize(size, relative: true) {
         throw CrabError("SIZE should look like 40G, or +10G to grow by that much")
     }
@@ -776,6 +877,9 @@ public func sshCommand(_ paths: Paths, _ target: String) throws(CrabError) -> [S
         name = String(target[target.index(after: at)...])
     }
     let dir = try vmPath(paths, name)
+    if isMacOSVM(dir) {
+        throw CrabError("\(name) is a macOS VM. Virtualization's NAT doesn't forward host ports, so crab ssh doesn't apply. Use the guest's window, or turn on Screen Sharing in the guest.")
+    }
     let port = confGet(dir, "ssh_port")
     if port.isEmpty || port == "0" {
         throw CrabError("\(name) has no SSH port; give it one with: crab set \(name) ssh_port=2222 (then reboot it)")

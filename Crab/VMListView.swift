@@ -52,7 +52,9 @@ struct VMListView: View {
         ) { vm in
             Button("Move to Trash", role: .destructive) { model.deleteVM(vm.name) }
         } message: { vm in
-            Text("This moves \(vm.dir.path) (\(vm.diskUsed)) to the Trash, including its disk and snapshots.")
+            Text(vm.backend == vmBackendVZ
+                ? "This moves \(vm.dir.path) (\(vm.diskUsed)) to the Trash, including its disk. macOS VMs don't have snapshots."
+                : "This moves \(vm.dir.path) (\(vm.diskUsed)) to the Trash, including its disk and snapshots.")
         }
     }
 
@@ -60,6 +62,8 @@ struct VMListView: View {
         VMRow(vm: vm, onSnapshots: { snapshotsFor = vm }, onDelete: { confirmDelete = vm })
             .contextMenu {
                 Button("Snapshots…") { snapshotsFor = vm }
+                .disabled(vm.backend == vmBackendVZ)
+                .help(vm.backend == vmBackendVZ ? "macOS VMs have no disk snapshots" : "Snapshots of this VM's disk")
                 Button("Clone…") { nameEdit = NameEdit(vm: vm, kind: .clone) }
                     .disabled(vm.runningPID != nil)
                 Button("Rename…") { nameEdit = NameEdit(vm: vm, kind: .rename) }
@@ -113,10 +117,12 @@ private struct ThrowawayRow: View {
                 ProgressView()
                     .controlSize(.small)
             }
-            SendKeyMenu(dir: vm.dir, name: vm.defaultName)
-                .disabled(busy)
-            ChangeDiscMenu(dir: vm.dir, name: vm.defaultName)
-                .disabled(busy)
+            if !isMacOSVM(vm.dir) {
+                SendKeyMenu(dir: vm.dir, name: vm.defaultName)
+                    .disabled(busy)
+                ChangeDiscMenu(dir: vm.dir, name: vm.defaultName)
+                    .disabled(busy)
+            }
             Button("Force Off", role: .destructive) { model.forceOffThrowaway(vm) }
                 .disabled(busy)
         }
@@ -238,13 +244,22 @@ private struct VMRow: View {
                     .controlSize(.small)
             }
             if running {
-                SendKeyMenu(dir: vm.dir, name: vm.name)
-                    .disabled(busy)
-                ChangeDiscMenu(dir: vm.dir, name: vm.name)
-                    .disabled(busy)
+                if vm.backend != vmBackendVZ {
+                    SendKeyMenu(dir: vm.dir, name: vm.name)
+                        .disabled(busy)
+                    ChangeDiscMenu(dir: vm.dir, name: vm.name)
+                        .disabled(busy)
+                }
                 Button("Shut Down") { model.stopVM(vm.name) }
                     .disabled(busy)
                 Button("Force Off", role: .destructive) { model.forceOffVM(vm.name) }
+                    .disabled(busy)
+            } else if vm.backend == vmBackendVZ {
+                Button("No Snapshots") {}
+                    .disabled(true)
+                    .help("Apple's Virtualization framework has no disk snapshots")
+                Button("Boot") { model.bootVM(vm.name) }
+                    .buttonStyle(.borderedProminent)
                     .disabled(busy)
             } else {
                 Button("Snapshots (\(vm.snapsCount))", action: onSnapshots)

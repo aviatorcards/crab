@@ -170,6 +170,10 @@ final class AppModel {
     private(set) var vmOps: Set<String> = []
     /// Images being prepared for boot (scanned, disk created) before QEMU starts.
     private(set) var booting: Set<String> = []
+    /// macOS guests this process is showing. The window controller keeps the VM alive.
+    @ObservationIgnored private var guestWindows: [String: MacOSGuestWindowController] = []
+    /// Guests already handed to the keep/discard prompt, so a close and a stop don't both ask.
+    @ObservationIgnored private var finishedGuests: Set<String> = []
 
     /// Bumped by every reload so results from older, slower loads are dropped.
     private var reloadGen = 0
@@ -294,8 +298,10 @@ final class AppModel {
     /// seconds, reloading if any changed, so VMs started or stopped elsewhere show up.
     func pollStates() async {
         await adoptLeftoverThrowaways()
+        consumeMacOSLaunchRequest()
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(2))
+            consumeMacOSLaunchRequest()
             let adoptedDirs = Array(adopted.keys)
             let exited = await Task.detached {
                 adoptedDirs.filter { vmPID($0) == nil }
@@ -362,15 +368,148 @@ final class AppModel {
     }
 
     func bootVM(_ name: String) {
+        if let dir = try? vmPath(paths, name), isMacOSVM(dir) {
+            startSavedMacOS(name, mem: nil, cpus: nil)
+            return
+        }
         spawn(key: name, vmName: name, image: nil, opts: bootOptions(), started: "Booted '\(name)'.")
     }
 
     func bootImage(_ url: URL, opts: BootOptions? = nil, label: String? = nil) {
         let opts = opts ?? bootOptions()
+        if isIPSW(url) {
+            let named = namedVMInput.trimmingCharacters(in: .whitespaces)
+            startMacOSInstall(image: url, opts: opts, explicitName: named.isEmpty ? nil : named)
+            return
+        }
         let named = namedVMInput.trimmingCharacters(in: .whitespaces)
         let what = label ?? "'\(url.lastPathComponent)'"
         let started = opts.keep ? "Booted \(what) as a saved VM." : opts.live ? "Booted \(what) live, with no disk." : "Booted \(what) in a throwaway VM."
         spawn(key: url.path, image: url, namedTarget: named.isEmpty ? nil : named, opts: opts, started: started)
+    }
+
+    /// A request the CLI wrote, so a macOS guest opens here even if Crab was already running.
+    func consumeMacOSLaunchRequest() {
+        guard let request = takeMacOSLaunchRequest(paths) else { return }
+        switch request.kind {
+        case .boot:
+            startSavedMacOS(request.vm, mem: request.mem.isEmpty ? nil : request.mem, cpus: request.cpus.isEmpty ? nil : request.cpus)
+        case .install:
+            var opts = bootOptions()
+            opts.keep = request.keep
+            opts.live = false
+            if !request.mem.isEmpty { opts.mem = request.mem }
+            if !request.cpus.isEmpty { opts.cpus = request.cpus }
+            if !request.disk.isEmpty { opts.diskSize = request.disk }
+            startMacOSInstall(image: URL(filePath: request.image), opts: opts, explicitName: request.name.isEmpty ? nil : request.name)
+        }
+    }
+
+    private func startSavedMacOS(_ name: String, mem: String?, cpus: String?) {
+        if let reason = macosHostBlockReason() {
+            status = reason
+            return
+        }
+        guard booting.insert(name).inserted else { return }
+        status = "Starting '\(name)'…"
+        let paths = paths
+        Task {
+            defer { booting.remove(name) }
+            do {
+                let guest = try await MacOSGuest.make(
+                    paths: paths, image: nil, savedName: name, keep: true, keepName: name,
+                    mem: mem, cpus: cpus, disk: nil
+                )
+                presentMacOSGuest(guest)
+                await guest.run()
+                if guest.phase == .failed {
+                    status = guest.message
+                } else {
+                    finishMacOSGuest(guest)
+                }
+            } catch let error as CrabError {
+                status = "Couldn't start '\(name)': \(error.message)"
+            } catch {
+                status = "Couldn't start '\(name)': \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func startMacOSInstall(image: URL, opts: BootOptions, explicitName: String?) {
+        if opts.live {
+            status = "macOS restore images can't boot live, because installing macOS needs a disk."
+            return
+        }
+        if let reason = macosHostBlockReason() {
+            status = reason
+            return
+        }
+        if let error = launchSettingsError() {
+            status = error
+            return
+        }
+        let key = image.path
+        guard booting.insert(key).inserted else { return }
+        status = "Preparing \(image.lastPathComponent)…"
+        let paths = paths
+        Task {
+            defer { booting.remove(key) }
+            do {
+                let guest = try await MacOSGuest.make(
+                    paths: paths, image: image, savedName: nil, keep: opts.keep,
+                    keepName: explicitName, mem: opts.mem, cpus: opts.cpus, disk: opts.diskSize
+                )
+                presentMacOSGuest(guest)
+                status = opts.keep ? "Installing macOS as a saved VM." : "Installing macOS in a throwaway VM."
+                await guest.run()
+                if guest.phase == .failed {
+                    status = guest.message
+                } else {
+                    finishMacOSGuest(guest)
+                }
+            } catch let error as CrabError {
+                status = "Couldn't start the macOS guest: \(error.message)"
+            } catch {
+                status = "Couldn't start the macOS guest: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func presentMacOSGuest(_ guest: MacOSGuest) {
+        let key = guest.directory.path
+        if let existing = guestWindows[key] {
+            existing.show()
+            return
+        }
+        let controller = MacOSGuestWindowController(guest: guest) { [weak self] in
+            guard let self else { return }
+            guest.requestStop()
+            if guest.phase == .failed || guest.phase == .stopped {
+                self.finishMacOSGuest(guest)
+            }
+        }
+        guestWindows[key] = controller
+        controller.show()
+    }
+
+    private func finishMacOSGuest(_ guest: MacOSGuest) {
+        let key = guest.directory.path
+        guard finishedGuests.insert(key).inserted else { return }
+        guestWindows[key]?.suppressClose = true
+        guestWindows[key]?.close()
+        guestWindows[key] = nil
+        if let info = guest.throwaway {
+            adopted.removeValue(forKey: info.dir)
+            throwawayExited(info)
+        }
+        if guest.phase == .failed {
+            status = guest.message
+        } else if guest.throwaway == nil {
+            status = "'\(guest.displayName)' stopped."
+        } else {
+            status = "'\(guest.displayName)' stopped. Keep the VM, or trash it."
+        }
+        reload()
     }
 
     private func spawn(key: String, vmName: String? = nil, image: URL?, namedTarget: String? = nil, opts: BootOptions, started: String) {
@@ -437,7 +576,7 @@ final class AppModel {
     private func throwawayExited(_ info: ThrowawayInfo) {
         reload()
         let scratch = info.dir
-        let disk = scratch.appending(path: "disk.qcow2")
+        let disk = vmDiskURL(scratch)
         let usedKB = info.live ? 0 : diskKB(disk)
         if !info.live && usedKB < 1024 && info.imagePath == nil {
             try? FileManager.default.removeItem(at: scratch)
@@ -467,6 +606,8 @@ final class AppModel {
         }
         try? FileManager.default.removeItem(at: prompt.scratchDir.appending(path: "qemu.pid"))
         try? FileManager.default.removeItem(at: QMP.socketPath(prompt.scratchDir))
+        try? FileManager.default.removeItem(at: prompt.scratchDir.appending(path: MacOSVMLayout.pidName))
+        try? FileManager.default.removeItem(at: prompt.scratchDir.appending(path: MacOSVMLayout.socketName))
         try? FileManager.default.removeItem(at: throwawayInfoFile(prompt.scratchDir))
         do {
             try FileManager.default.moveItem(at: prompt.scratchDir, to: dest)
@@ -661,6 +802,10 @@ final class AppModel {
     }
 
     func downloadRelease(_ entry: CatalogEntry, bootAfter: Bool) {
+        if entry.distro == macosDistro, let reason = macosGuestRefusal(hostArchitecture: hostArch()) {
+            status = reason
+            return
+        }
         guard download == nil else { return }
         let file = getFilename(distro: entry.distro, arch: entry.arch, url: entry.url)
         let cancel = CancelFlag()
@@ -687,7 +832,7 @@ final class AppModel {
         Task {
             let result = await Task.detached {
                 await attempt { () async throws(CrabError) in
-                    try await downloadImage(paths, url: entry.url, sha256: entry.sha256, file: file, dryRun: false, cancel: cancel, report: report)
+                    try await downloadImage(paths, url: entry.url, sha256: entry.sha256, file: file, dryRun: false, cancel: cancel, report: report, sha1: entry.sha1)
                 }
             }.value
             download = nil

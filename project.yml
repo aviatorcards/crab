@@ -43,10 +43,14 @@ targets:
         type: syncedFolder
     dependencies:
       - target: CrabKit
+      - sdk: Virtualization.framework
     settings:
       base:
         PRODUCT_NAME: crab
         PRODUCT_BUNDLE_IDENTIFIER: com.tristansmith.crab-cli
+        # latestSupported runs in this process. Creating the VM does not;
+        # the entitlement is here so a future in-process guest is already signed.
+        CODE_SIGN_ENTITLEMENTS: Crab/Crab.entitlements
 
   # The SwiftUI app. Ships the CLI at Crab.app/Contents/Helpers/crab.
   Crab:
@@ -57,6 +61,7 @@ targets:
         type: syncedFolder
     dependencies:
       - target: CrabKit
+      - sdk: Virtualization.framework
       - target: crab
         embed: true
         codeSign: true
@@ -72,8 +77,12 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.developer-tools
         NSHumanReadableCopyright: ""
+        # A macOS guest dies if the system quits Crab out from under it.
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
         # Downloads may come from plain-HTTP mirrors; every image is checked
-        # against the official SHA-256 before it's used.
+        # against the official SHA-256 before it's used. macOS restore images
+        # use the SHA-1 Apple publishes instead.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
     settings:
@@ -84,6 +93,8 @@ targets:
         # crab runs QEMU and manages ~/VMs, which a sandboxed app can't do.
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: NO
+        # The app process is what creates VZVirtualMachine.
+        CODE_SIGN_ENTITLEMENTS: Crab/Crab.entitlements
     scheme:
       testTargets:
         - CrabKitTests
@@ -96,6 +107,7 @@ targets:
         type: syncedFolder
     dependencies:
       - target: CrabKit
+      - sdk: Virtualization.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tristansmith.CrabKitTests

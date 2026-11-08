@@ -303,6 +303,9 @@ public func unsupportedImageReason(_ url: URL) -> String? {
 /// is an error rather than an empty list. That's checked first, since
 /// `detectArch` may read the whole image; a name naming an arch crab boots wins.
 func detectBootableArch(_ url: URL) throws(CrabError) -> [String] {
+    if isIPSW(url) {
+        throw CrabError("\(url.lastPathComponent) is a macOS restore image. crab installs those with Apple's Virtualization framework (crab get macos), not QEMU.")
+    }
     if archFromName(url.path) == nil, let why = unsupportedImageReason(url) {
         throw CrabError(why)
     }
@@ -382,7 +385,7 @@ public func pickFromMenu(_ paths: Paths) throws(CrabError) -> MenuPick {
     }
 
     if choices.isEmpty {
-        throw CrabError("no .iso/.img files in \(paths.searchDir.path) and no VMs in \(paths.vmRoot.path)")
+        throw CrabError("no .iso/.img/.ipsw files in \(paths.searchDir.path) and no VMs in \(paths.vmRoot.path)")
     }
     guard let idx = selectNumbered(labels, header: "Choose something to boot:") else {
         throw CrabError("nothing chosen")
@@ -1028,6 +1031,15 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
         }
     }
 
+    if let vmDir, isMacOSVM(vmDir) {
+        try launchSavedMacOSVM(paths, opts, dir: vmDir)
+        return
+    }
+    if let image, isIPSW(image) {
+        try launchMacOSInstaller(paths, opts, image: image)
+        return
+    }
+
     let mode: BootMode
     if image == nil {
         if opts.live || opts.keep {
@@ -1293,6 +1305,13 @@ public func spawnFromGUI(
     var arch = ""
     var defaultName = ""
     let image = imagePath.map(absPath)
+
+    if let image, isIPSW(image) {
+        throw CrabError("\(image.lastPathComponent) is a macOS restore image. Install it from Get Distros or Local Images; it uses Virtualization.framework, not QEMU.")
+    }
+    if let vmName, let dir = try? vmPath(paths, vmName), isMacOSVM(dir) {
+        throw CrabError("\(vmName) is a macOS VM. Boot it from the Saved VMs list; it doesn't run under QEMU.")
+    }
 
     let mode: BootMode
     if image == nil {
