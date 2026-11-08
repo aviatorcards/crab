@@ -39,7 +39,7 @@ struct ContentView: View {
                 Button("Boot Image…", systemImage: "play.circle") {
                     model.showImagePicker = true
                 }
-                .help("Boot an .iso or .img file with the launch settings")
+                .help("Boot an .iso, .img, or macOS .ipsw with the launch settings")
                 Button("Refresh", systemImage: "arrow.clockwise") {
                     model.reload()
                 }
@@ -58,7 +58,7 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $model.showImagePicker,
-            allowedContentTypes: [.diskImage, UTType(filenameExtension: "iso") ?? .data, UTType(filenameExtension: "img") ?? .data]
+            allowedContentTypes: [.diskImage, UTType(filenameExtension: "iso") ?? .data, UTType(filenameExtension: "img") ?? .data, UTType(filenameExtension: "ipsw") ?? .data]
         ) { result in
             if case .success(let url) = result {
                 model.bootImage(url)

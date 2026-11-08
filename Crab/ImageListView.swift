@@ -12,7 +12,7 @@ struct ImageListView: View {
                 ContentUnavailableView {
                     Label("No Images", systemImage: "opticaldisc")
                 } description: {
-                    Text("There are no .iso or .img files in \(model.searchDirDisplay). Download one from Get Distros, or choose another folder.")
+                    Text("There are no .iso, .img, or .ipsw files in \(model.searchDirDisplay). Download one from Get Distros, or choose another folder.")
                 } actions: {
                     Button("Choose Folder…") { choosingFolder = true }
                 }
@@ -73,7 +73,7 @@ private struct ImageRow: View {
         let booting = model.booting.contains(img.path.path)
 
         HStack(spacing: 12) {
-            Image(systemName: "opticaldisc")
+            Image(systemName: img.path.pathExtension.lowercased() == "ipsw" ? "macwindow" : "opticaldisc")
                 .font(.title2)
                 .foregroundStyle(.secondary)
                 .frame(width: 30)

@@ -369,22 +369,25 @@ public struct ImageEntry: Sendable, Hashable, Identifiable {
     public var id: URL { path }
 }
 
-/// The .iso files in the search folder, then the .img files, each sorted by path.
+/// The .iso files in the search folder, then the .img files, then macOS
+/// restore images (`.ipsw`), each sorted by path.
 /// Each path is the directory entry. A symlink is listed as the link, so
 /// deleting it does not delete the file it points at.
 public func listImagePaths(_ paths: Paths) -> [URL] {
     let entries = (try? FileManager.default.contentsOfDirectory(at: paths.searchDir, includingPropertiesForKeys: nil)) ?? []
     var isos: [URL] = []
     var imgs: [URL] = []
+    var ipsws: [URL] = []
     for url in entries where url.isFile {
         let entry = imageEntryPath(url)
         switch entry.pathExtension.lowercased() {
         case "iso": isos.append(entry)
         case "img": imgs.append(entry)
+        case "ipsw": ipsws.append(entry)
         default: break
         }
     }
-    return isos.sorted { $0.path < $1.path } + imgs.sorted { $0.path < $1.path }
+    return isos.sorted { $0.path < $1.path } + imgs.sorted { $0.path < $1.path } + ipsws.sorted { $0.path < $1.path }
 }
 
 /// Reads an ISO 9660 Primary Volume Descriptor: sector 16 (offset 0x8000)
@@ -420,9 +423,10 @@ public func extractQuotedLabel(_ fileOutput: String) -> String {
 
 public func listImageEntries(_ paths: Paths) -> [ImageEntry] {
     listImagePaths(paths).map { url in
-        // Size follows the symlink so a link to an ISO still shows the ISO's
-        // size. `path` stays the directory entry that delete and trash use.
+        // Size follows the symlink so a link to an ISO or IPSW still shows
+        // the file's size. `path` stays the directory entry that delete and trash use.
         let opened = pathOpenedForBoot(url)
+        let info = isIPSW(url) ? "macOS restore image" : extractQuotedLabel(fileBrief(opened))
         return ImageEntry(
             path: url,
             name: url.lastPathComponent,
@@ -430,7 +434,7 @@ public func listImageEntries(_ paths: Paths) -> [ImageEntry] {
             sizeKB: diskKB(opened),
             downloadedSecs: fileBirthtime(url),
             lastBootedSecs: imageLastBoot(paths, url),
-            fileInfo: extractQuotedLabel(fileBrief(url))
+            fileInfo: info
         )
     }
 }

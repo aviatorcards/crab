@@ -62,23 +62,33 @@ Each setting is resolved in this order: CLI flag, then the VM's saved `vm.conf` 
 ### On-disk layout (shared with vmboot)
 
 ```
-~/VMs/<name>/disk.qcow2   disk (snapshots stored inside it)
+~/VMs/<name>/disk.qcow2   disk (snapshots stored inside it) — QEMU VMs
 ~/VMs/<name>/vm.conf      key=value settings; the last occurrence of a key wins
                           (fwd=8080:80,udp:53:53 and ssh_user= are crab-only keys)
 ~/VMs/<name>/efivars.fd   per-VM UEFI vars
 ~/VMs/<name>/qemu.pid     present while running
 ~/VMs/<name>/qmp.sock     QMP control socket while running (not created by vmboot)
+~/VMs/<name>/Disk.img     macOS guests only (backend=vz): raw sparse disk, not qcow2
+~/VMs/<name>/HardwareModel
+~/VMs/<name>/MachineIdentifier
+~/VMs/<name>/AuxiliaryStorage
+~/VMs/<name>/vz.pid       Crab's pid while that macOS guest is running
+~/VMs/<name>/vz.sock      stop/quit for a macOS guest (not QMP)
 ~/VMs/<name>/arch         legacy (pre-vm.conf) VMs only: confGet falls back to it
 ~/VMs/.scratch/           throwaway VMs
 ~/VMs/.scratch/*/gui-session  name/image/live/state of an app-started throwaway
-                          (state=running while QEMU is up, state=pending while
-                          Keep/Discard is unfinished). Cleanup leaves these
-                          directories alone so a relaunched app can re-adopt
-                          them (crab-only)
+                          (QEMU or macOS). state=running while the guest is up,
+                          state=pending while Keep/Discard is unfinished.
+                          Cleanup leaves these directories alone so a relaunched
+                          app can re-adopt them (crab-only)
 ~/VMs/.image-history      last-boot times per image
 ~/VMs/.catalog            synced release list (refreshed after 7 days)
 ~/VMs/mirrors             optional mirror overrides
 ~/VMs/config              crab-only settings (e.g. search_dir=)
 ```
+
+### macOS guests (Virtualization.framework)
+
+Apple Silicon only. QEMU VMs are unchanged: a directory is a macOS VM when it has `Disk.img` and `backend=vz` (or a `HardwareModel` and no `disk.qcow2`). `crab get macos` resolves the IPSW via `VZMacOSRestoreImage.latestSupported`, falling back to Apple's `VirtualMac2,1` feed, and downloads it with the shared resumable downloader (SHA-1 when the feed has one). The CLI writes `~/VMs/.macos-launch` and opens Crab.app; the app creates the hardware model, machine identifier, auxiliary storage, and disk, runs `VZMacOSInstaller`, then shows `VZVirtualMachineView`. Snapshots, SSH forwards, disc changes, and `crab key` are refused for these VMs. `list` / `delete` / `rename` / `clone` / `resize` (grow the raw disk) work. Don't point `buildQemuCommand` at an `.ipsw`.
 
 Hardware defaults depend on whether the VM was created by older vmboot versions. New x86 VMs get `hw=standard` (q35, AHCI + e1000), or `hw=legacy` (i440fx, IDE + PCnet; crab-only) when they boot with BIOS, while arm64 VMs and older VMs get `virtio`. arm64 only allows `virtio`. `ppc` VMs (mac99, OpenBIOS, one CPU) always save `hw=mac99` and `firmware=openbios`. VMs without a `display` key default to the serial terminal on arm64. Don't change these fallbacks without accounting for existing VMs.

@@ -33,7 +33,7 @@ struct ReleasesView: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             HStack {
-                Text("Saved to \(model.searchDirDisplay) and checked against the official SHA-256 sums.")
+                Text("Saved to \(model.searchDirDisplay). SHA-256 when the project publishes one; SHA-1 for macOS restore images.")
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer()
@@ -63,6 +63,7 @@ private struct ReleaseRow: View {
     var body: some View {
         let downloaded = model.isDownloaded(entry)
         let downloading = model.download != nil
+        let verifiable = !entry.sha256.isEmpty || !entry.sha1.isEmpty
 
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
@@ -76,9 +77,11 @@ private struct ReleaseRow: View {
                     if downloaded {
                         Tag("downloaded", color: .green)
                     }
-                    if entry.sha256.isEmpty {
+                    if entry.sha256.isEmpty && entry.sha1.isEmpty {
                         Tag("unverified", color: .orange)
-                            .help("This project doesn't publish checksums, so the download can't be verified")
+                            .help(entry.distro == macosDistro
+                                ? "Apple didn't publish a checksum for this restore image. The installer rejects a damaged one."
+                                : "This project doesn't publish checksums, so the download can't be verified")
                     }
                 }
                 Text(getFilename(distro: entry.distro, arch: entry.arch, url: entry.url))
@@ -89,14 +92,14 @@ private struct ReleaseRow: View {
             Button(downloaded ? "Verify" : "Download") {
                 model.downloadRelease(entry, bootAfter: false)
             }
-            .disabled(downloading || (downloaded && entry.sha256.isEmpty))
+            .disabled(downloading || (downloaded && !verifiable))
             .help(downloaded ? "Check the downloaded file against the release checksum" : "Download without booting")
             Button(downloaded ? "Boot" : "Get & Boot") {
                 model.downloadRelease(entry, bootAfter: true)
             }
             .buttonStyle(.borderedProminent)
             .disabled(downloading)
-            .help("Boot in a throwaway VM")
+            .help(entry.distro == macosDistro ? "Download Apple's restore image and install it in a throwaway macOS VM" : "Boot in a throwaway VM")
         }
         .padding(.vertical, 4)
     }

@@ -609,12 +609,16 @@ struct BootTests {
         try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
         try "state=pending\n".write(to: scratch.appending(path: "gui-session"), atomically: true, encoding: .utf8)
         try "123\n".write(to: scratch.appending(path: "qemu.pid"), atomically: true, encoding: .utf8)
+        try "123\n".write(to: scratch.appending(path: "vz.pid"), atomically: true, encoding: .utf8)
+        try Data().write(to: scratch.appending(path: "vz.sock"))
         let dest = root.appending(path: "kept", directoryHint: .isDirectory)
         try keepScratchVM(scratch, to: dest)
         #expect(!fm.fileExists(atPath: scratch.path))
         #expect(read(dest.appending(path: "disk.qcow2")) == "guest-data")
         #expect(!fm.fileExists(atPath: dest.appending(path: "gui-session").path))
         #expect(!fm.fileExists(atPath: dest.appending(path: "qemu.pid").path))
+        #expect(!fm.fileExists(atPath: dest.appending(path: "vz.pid").path))
+        #expect(!fm.fileExists(atPath: dest.appending(path: "vz.sock").path))
     }
 
     @Test func discardRemovesTheScratchVM() throws {
