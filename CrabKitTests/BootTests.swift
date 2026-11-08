@@ -507,4 +507,152 @@ struct BootTests {
             -display cocoa,zoom-to-fit=on,full-screen=off
             """)
     }
+
+    @Test func plainImagePathsAreNotRewritten() {
+        let image = URL(filePath: "/img/fedora.iso")
+        #expect(pathOpenedForBoot(image).path == image.path)
+        #expect(imageEntryPath(image).path == image.path)
+    }
+
+    /// A symlink is resolved only for the QEMU file= argument.
+    @Test func qemuOpensTheSymlinkTarget() throws {
+        let fm = FileManager.default
+        let root = testDir("symlink-boot")
+        let targetDir = root.appending(path: "target", directoryHint: .isDirectory)
+        let linkDir = root.appending(path: "links", directoryHint: .isDirectory)
+        try fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: linkDir, withIntermediateDirectories: true)
+        let target = targetDir.appending(path: "payload.iso")
+        let link = linkDir.appending(path: "alias.iso")
+        try Data("iso").write(to: target)
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let opened = pathOpenedForBoot(link)
+        #expect(opened.path != link.path)
+        #expect(isSymlink(link))
+        #expect(!isSymlink(opened))
+
+        var s = settings("amd64")
+        s.sshPort = ""
+        s.forwards = []
+        let req = request(.throwaway, ImageInfo(path: link, isCD: true, isBSD: false))
+        let cmd = try buildQemuCommand(s, req, hostArch: "arm64", uefi: share, forceWindow: false)
+        #expect(cmd.args.contains { $0.contains("file=\(opened.path)") })
+        #expect(!cmd.args.contains { $0.contains("file=\(link.path)") })
+    }
+
+    /// Allocated size used to auto-discard disks under 1 MB. Keep is offered
+    /// for every throwaway with a disk, however small that disk is.
+    @Test func smallDisksAreStillOfferedForKeeping() {
+        #expect(throwawayShouldOfferKeep(live: false))
+        #expect(!throwawayShouldOfferKeep(live: true))
+    }
+
+    @Test func keepNamesUseTheSharedRules() throws {
+        #expect(try resolvedKeepName("  ", defaultName: "debian-amd64") == "debian-amd64")
+        #expect(try resolvedKeepName("  my-vm  ", defaultName: "x") == "my-vm")
+        #expect(throws: CrabError.self) { try resolvedKeepName("a:b", defaultName: "x") }
+        #expect(throws: CrabError.self) { try resolvedKeepName("a\\b", defaultName: "x") }
+        #expect(throws: CrabError.self) { try resolvedKeepName(".", defaultName: "x") }
+        #expect(throws: CrabError.self) { try resolvedKeepName("", defaultName: ".hidden") }
+    }
+
+    @Test func abandonedKeepLeavesTheScratchVM() throws {
+        let fm = FileManager.default
+        let scratch = testDir("abandon-keep").appending(path: "scratch", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
+        do {
+            try abandonKeep(scratch)
+        } catch let error as CrabError {
+            #expect(error.message.contains("not deleted"))
+            #expect(error.message.contains(scratch.path))
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+        #expect(read(scratch.appending(path: "disk.qcow2")) == "guest-data")
+    }
+
+    @Test func failedKeepLeavesTheScratchVMAndItsMarker() throws {
+        let fm = FileManager.default
+        let root = testDir("keep-fail")
+        let scratch = root.appending(path: "scratch", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
+        try "state=pending\n".write(to: scratch.appending(path: "gui-session"), atomically: true, encoding: .utf8)
+        try "999999\n".write(to: scratch.appending(path: "qemu.pid"), atomically: true, encoding: .utf8)
+        let destParent = root.appending(path: "vms", directoryHint: .isDirectory)
+        try fm.createDirectory(at: destParent, withIntermediateDirectories: true)
+        let dest = destParent.appending(path: "taken", directoryHint: .isDirectory)
+        try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+
+        var message = ""
+        do {
+            try keepScratchVM(scratch, to: dest)
+        } catch let error as CrabError {
+            message = error.message
+        } catch {
+            message = "unexpected"
+        }
+        #expect(message.contains("not deleted"))
+        #expect(message.contains(scratch.path))
+        #expect(read(scratch.appending(path: "disk.qcow2")) == "guest-data")
+        #expect(read(scratch.appending(path: "gui-session")) == "state=pending\n")
+        #expect(fm.fileExists(atPath: dest.appending(path: "disk.qcow2").path) == false)
+    }
+
+    @Test func successfulKeepDropsTheSessionMarker() throws {
+        let fm = FileManager.default
+        let root = testDir("keep-ok")
+        let scratch = root.appending(path: "scratch", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
+        try "state=pending\n".write(to: scratch.appending(path: "gui-session"), atomically: true, encoding: .utf8)
+        try "123\n".write(to: scratch.appending(path: "qemu.pid"), atomically: true, encoding: .utf8)
+        try "123\n".write(to: scratch.appending(path: "vz.pid"), atomically: true, encoding: .utf8)
+        try Data().write(to: scratch.appending(path: "vz.sock"))
+        let dest = root.appending(path: "kept", directoryHint: .isDirectory)
+        try keepScratchVM(scratch, to: dest)
+        #expect(!fm.fileExists(atPath: scratch.path))
+        #expect(read(dest.appending(path: "disk.qcow2")) == "guest-data")
+        #expect(!fm.fileExists(atPath: dest.appending(path: "gui-session").path))
+        #expect(!fm.fileExists(atPath: dest.appending(path: "qemu.pid").path))
+        #expect(!fm.fileExists(atPath: dest.appending(path: "vz.pid").path))
+        #expect(!fm.fileExists(atPath: dest.appending(path: "vz.sock").path))
+    }
+
+    @Test func discardRemovesTheScratchVM() throws {
+        let fm = FileManager.default
+        let scratch = testDir("discard-ok").appending(path: "scratch", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
+        try applyThrowawayChoice(.discard, scratch: scratch, dest: scratch)
+        #expect(!fm.fileExists(atPath: scratch.path))
+    }
+
+    /// A discard that cannot remove the directory must leave the disk and the
+    /// gui-session marker. The app keeps its prompt when this throws.
+    @Test func failedDiscardLeavesTheScratchVM() throws {
+        let fm = FileManager.default
+        let scratch = testDir("discard-fail").appending(path: "scratch", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("guest-data").write(to: scratch.appending(path: "disk.qcow2"))
+        try "state=pending\n".write(to: scratch.appending(path: "gui-session"), atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: NSNumber(value: 0)], ofItemAtPath: scratch.path)
+        defer { try? fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: scratch.path) }
+
+        var message = ""
+        do {
+            try discardScratch(scratch, how: .delete)
+        } catch let error as CrabError {
+            message = error.message
+        } catch {
+            message = "unexpected"
+        }
+        try fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: scratch.path)
+        #expect(message.contains("still there"))
+        #expect(message.contains(scratch.path))
+        #expect(read(scratch.appending(path: "disk.qcow2")) == "guest-data")
+        #expect(read(scratch.appending(path: "gui-session")) == "state=pending\n")
+    }
 }

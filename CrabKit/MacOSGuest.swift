@@ -116,10 +116,11 @@ public final class MacOSGuest {
                 imageURL = nil
             } else {
                 let path = config.restoreImage
-                guard !path.isEmpty, URL(filePath: path).isFile else {
+                let opened = pathOpenedForBoot(URL(filePath: path))
+                guard !path.isEmpty, opened.isFile else {
                     throw CrabError("\(savedName) never finished installing, and its restore image is missing\(path.isEmpty ? "" : " (\(path))"). Delete it and run crab get macos again.")
                 }
-                imageURL = URL(filePath: path)
+                imageURL = opened
             }
             return MacOSGuest(
                 directory: dir, displayName: savedName, throwaway: nil, imageURL: imageURL,
@@ -128,16 +129,21 @@ public final class MacOSGuest {
             )
         }
 
-        guard let image, image.isFile else {
+        guard let image else {
             throw CrabError("no macOS restore image to install")
         }
-        let imageURL = absPath(image)
+        // `entry` is what a later trash deletes. `opened` is the IPSW itself
+        // when `entry` is a symlink.
+        let entry = imageEntryPath(image)
+        let imageURL = pathOpenedForBoot(entry)
+        guard imageURL.isFile else {
+            throw CrabError("no macOS restore image to install")
+        }
         let plan = resolveMacOSHardware(mem: mem, cpus: cpus, disk: disk)
         let version = macosVersionFromIPSWName(imageURL.path) ?? ""
         let build = macosBuildFromIPSWName(imageURL.path) ?? ""
         if keep {
-            let name = keepName.flatMap { $0.trimmed.isEmpty ? nil : $0.trimmed } ?? defaultVMName(imageURL, arch: "arm64")
-            try checkName(name)
+            let name = try resolvedKeepName(keepName ?? "", defaultName: defaultVMName(imageURL, arch: "arm64"))
             let dir = paths.vmRoot.appending(path: name, directoryHint: .isDirectory)
             if dir.exists {
                 throw CrabError("there's already a VM called '\(name)'")
@@ -157,7 +163,7 @@ public final class MacOSGuest {
             throw CrabError("failed to create scratch dir: \(error.localizedDescription)")
         }
         let name = defaultVMName(imageURL, arch: "arm64")
-        let info = ThrowawayInfo(dir: scratch, imagePath: imageURL, defaultName: name, live: false)
+        let info = ThrowawayInfo(dir: scratch, imagePath: entry, defaultName: name, live: false)
         do {
             try saveThrowawayInfo(info)
         } catch {

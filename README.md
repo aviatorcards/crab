@@ -6,7 +6,7 @@ Try out OS images on your Mac (Apple Silicon or Intel) in throwaway QEMU VMs, ke
 
 ## Features
 
-- **Throwaway VMs by default:** Point `crab` at an `.iso` or `.img`, or pick one from a menu of `~/Downloads` and `~/VMs`. When QEMU exits, `crab` asks whether to keep it—say no and both the VM and (optionally) the ISO are trashed. If nothing was written to the disk, it cleans up automatically without asking.
+- **Throwaway VMs by default:** Point `crab` at an `.iso` or `.img`, or pick one from a menu of `~/Downloads` and `~/VMs`. When QEMU exits, `crab` asks whether to keep it—say no and both the VM and (optionally) the ISO are trashed. The question is asked for every throwaway that had a disk; the size is only shown so you can decide.
 - **CLI & Mac App:** Run `crab` in the terminal for classic numbered menus and flags, or open **Crab.app** (or run `crab gui`) to browse and manage VMs, snapshots, local ISOs, and distro downloads.
 - **Built-in Release Catalog & Mirror Downloader:** Fetch the latest releases straight from each project's own release index or open directory, with automatic SHA-256 verification and `.part` download resumption—no `jq`, `curl`, `file`, or `du` required:
 

@@ -106,7 +106,7 @@ func dirName(_ dir: URL) -> String {
 
 public func checkName(_ name: String) throws(CrabError) {
     if name.isEmpty || name.hasPrefix(".") || name.contains("/") || name.contains("\\") || name.contains(":") {
-        throw CrabError("invalid VM name: '\(name)'")
+        throw CrabError("invalid VM name '\(name)': names can't be empty, start with a dot, or contain '/', '\\' or ':'")
     }
 }
 
@@ -269,13 +269,22 @@ public func cmdImages(_ paths: Paths) {
     print("\(fmtKB(totalKB)) in \(paths.searchDir.path)")
 }
 
-/// Deletes throwaway VMs left behind (e.g. by a crash), skipping running ones.
+/// Deletes throwaway VMs left behind (for example by a crash), skipping ones
+/// that are running and ones the app can still Keep or Discard.
+/// `preserving` is an extra set of scratch dirs (the app's open prompts).
 /// Returns how many were removed and the KB freed.
-public func cleanLeftoverScratch(_ paths: Paths) -> (count: Int, freedKB: Int) {
+public func cleanLeftoverScratch(_ paths: Paths, preserving protected: Set<URL> = []) -> (count: Int, freedKB: Int) {
     var n = 0
     var freed = 0
+    let keep = Set(protected.map { imageEntryPath($0).path })
     let entries = (try? FileManager.default.contentsOfDirectory(at: paths.scratchRoot, includingPropertiesForKeys: nil)) ?? []
     for p in entries where p.isDirectory && vmPID(p) == nil {
+        // A gui-session file means the app started this VM and has not
+        // finished Keep or Discard, including after a crash or quit.
+        // Both state=running and state=pending are kept.
+        if scratchIsRecoverable(p) || keep.contains(imageEntryPath(p).path) {
+            continue
+        }
         let kb = diskKB(p)
         if (try? FileManager.default.removeItem(at: p)) != nil {
             freed += kb
@@ -299,12 +308,13 @@ public func cmdClean(_ paths: Paths, days: Int) {
     for f in listImagePaths(paths) where imageLastUsed(paths, f) < cutoff {
         n += 1
         let booted = imageLastBoot(paths, f).map(fmtAge) ?? "never"
-        let prompt = "  image \(f.lastPathComponent) (\(humanSize(f)), downloaded \(fmtAge(fileBirthtime(f))), last booted \(booted))? [y/N/q] "
+        let kind = isSymlink(f) ? "link " : ""
+        let prompt = "  image \(kind)\(f.lastPathComponent) (\(humanSize(pathOpenedForBoot(f))), downloaded \(fmtAge(fileBirthtime(f))), last booted \(booted))? [y/N/q] "
         let ans = promptLine(prompt) ?? "q"
         switch ans.trimmed {
         case "y", "Y":
             let kb = diskKB(f)
-            if (try? FileManager.default.removeItem(at: f)) != nil {
+            if (try? removeImageEntry(f)) != nil {
                 freed += kb
             }
         case "q", "Q":
@@ -537,7 +547,7 @@ public func changeDisc(_ dir: URL, to image: URL?) throws(CrabError) -> String {
         guard image.isFile else {
             throw CrabError("no such image: \(image.path)")
         }
-        try QMP.changeMedium(dir, device: drive.device, image: absPath(image))
+        try QMP.changeMedium(dir, device: drive.device, image: pathOpenedForBoot(image))
         return "Inserted \(image.lastPathComponent) into \(name)."
     }
     try QMP.changeMedium(dir, device: drive.device, image: nil)
@@ -690,7 +700,7 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
         guard validPort(value) else { throw CrabError("ssh_port wants a port number (0 turns it off)") }
         return value
     case "ssh_user":
-        guard !value.isEmpty, !value.contains(where: { "@ \t".contains($0) }) else {
+        guard isValidSSHUser(value) else {
             throw CrabError("ssh_user wants a user name")
         }
         return value
@@ -868,6 +878,19 @@ public func cmdResize(_ paths: Paths, _ name: String, _ size: String) throws(Cra
     print("\(name)'s disk is now \(newSize). Grow the partition and filesystem inside the guest to use the space.")
 }
 
+/// A login name ssh will not treat as an option. A leading `-` would be a
+/// flag if it were glued onto the destination (`-oProxyCommand=…@localhost`),
+/// and control characters can smuggle extra arguments. `-l` and `--` are
+/// still used at the call site; this rejects the names those wouldn't save.
+public func isValidSSHUser(_ value: String) -> Bool {
+    guard !value.isEmpty, !value.hasPrefix("-") else { return false }
+    return value.allSatisfy { ch in
+        ch != "@" && !ch.isWhitespace && ch.unicodeScalars.allSatisfy {
+            $0.properties.generalCategory != .control
+        }
+    }
+}
+
 /// The ssh command line for `[USER@]NAME`, using the VM's forwarded port.
 public func sshCommand(_ paths: Paths, _ target: String) throws(CrabError) -> [String] {
     var user: String?
@@ -888,9 +911,20 @@ public func sshCommand(_ paths: Paths, _ target: String) throws(CrabError) -> [S
         let saved = confGet(dir, "ssh_user")
         user = saved.isEmpty ? nil : saved
     }
-    let host = user.map { "\($0)@localhost" } ?? "localhost"
-    // Key the guest's host key by VM name, not by port, since ports get reused.
-    return ["ssh", "-p", port, "-o", "HostKeyAlias=crab-\(name)", host]
+    if let user, !isValidSSHUser(user) {
+        throw CrabError("ssh_user wants a user name")
+    }
+    // `-l` takes the next argument as the login name even when it looks like
+    // a flag, and `--` stops option parsing before the destination. The
+    // username is also rejected when it starts with `-` or contains a
+    // control character, so a saved `ssh_user` can't be an ssh option.
+    var argv = ["ssh", "-p", port, "-o", "HostKeyAlias=crab-\(name)"]
+    if let user {
+        argv += ["-l", user]
+    }
+    argv.append("--")
+    argv.append("localhost")
+    return argv
 }
 
 public func cmdSSH(_ paths: Paths, _ target: String, _ command: [String]) throws(CrabError) {

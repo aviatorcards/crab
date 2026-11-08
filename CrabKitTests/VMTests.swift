@@ -35,6 +35,11 @@ struct VMTests {
         #expect(try validateSetting("firmware", "bios", arch: "amd64") == "bios")
         #expect(throws: CrabError.self) { try validateSetting("display", "vnc", arch: "amd64") }
         #expect(throws: CrabError.self) { try validateSetting("ssh_user", "a@b", arch: "amd64") }
+        #expect(throws: CrabError.self) { try validateSetting("ssh_user", "-oProxyCommand=id", arch: "amd64") }
+        #expect(throws: CrabError.self) { try validateSetting("ssh_user", "root\n-oBatchMode=yes", arch: "amd64") }
+        #expect(throws: CrabError.self) { try validateSetting("ssh_user", "root\u{7f}", arch: "amd64") }
+        #expect(try validateSetting("ssh_user", "alice", arch: "amd64") == "alice")
+        #expect(try validateSetting("ssh_user", "user.name", arch: "amd64") == "user.name")
         #expect(throws: CrabError.self) { try validateSetting("arch", "amd64", arch: "amd64") }
         #expect(throws: CrabError.self) { try validateSetting("mem", "lots", arch: "amd64") }
     }
@@ -79,10 +84,34 @@ struct VMTests {
         let paths = Paths(root: root)
         makeVM(root, "bsd", conf: "arch=amd64\nssh_port=2201\nssh_user=root\n")
         makeVM(root, "nossh", conf: "arch=amd64\nssh_port=0\n")
-        #expect(try sshCommand(paths, "bsd").joined(separator: " ") == "ssh -p 2201 -o HostKeyAlias=crab-bsd root@localhost")
-        #expect(try sshCommand(paths, "me@bsd").last == "me@localhost")
+        #expect(try sshCommand(paths, "bsd") == [
+            "ssh", "-p", "2201", "-o", "HostKeyAlias=crab-bsd", "-l", "root", "--", "localhost",
+        ])
+        #expect(try sshCommand(paths, "me@bsd") == [
+            "ssh", "-p", "2201", "-o", "HostKeyAlias=crab-bsd", "-l", "me", "--", "localhost",
+        ])
         #expect { try sshCommand(paths, "nossh") } throws: { ($0 as? CrabError)?.message.contains("no SSH port") == true }
         #expect(throws: CrabError.self) { try sshCommand(paths, "missing") }
+        #expect(throws: CrabError.self) { try sshCommand(paths, "-oProxyCommand=id@bsd") }
+        #expect(throws: CrabError.self) { try sshCommand(paths, "root\n-oBatchMode=yes@bsd") }
+
+        let poisoned = testDir("ssh-poison")
+        let poisonedPaths = Paths(root: poisoned)
+        makeVM(poisoned, "bsd", conf: "arch=amd64\nssh_port=2201\nssh_user=-oProxyCommand=id\n")
+        #expect(throws: CrabError.self) { try sshCommand(poisonedPaths, "bsd") }
+        makeVM(poisoned, "plain", conf: "arch=amd64\nssh_port=2222\n")
+        #expect(try sshCommand(poisonedPaths, "plain") == [
+            "ssh", "-p", "2222", "-o", "HostKeyAlias=crab-plain", "--", "localhost",
+        ])
+    }
+
+    @Test func vmNamesRejectSlashesColonsAndBackslashes() throws {
+        try checkName("debian-amd64")
+        #expect(throws: CrabError.self) { try checkName("") }
+        #expect(throws: CrabError.self) { try checkName(".hidden") }
+        #expect(throws: CrabError.self) { try checkName("a/b") }
+        #expect(throws: CrabError.self) { try checkName("a\\b") }
+        #expect(throws: CrabError.self) { try checkName("win:disk") }
     }
 
     @Test func stoppedVMs() throws {
@@ -115,5 +144,38 @@ struct VMTests {
         #expect(!found[0].live)
         #expect(found[1].imagePath == nil)
         #expect(found[1].live)
+        #expect(readConfigKey(throwawayInfoFile(gui), "state") == guiSessionRunning)
+    }
+
+    /// Cleanup may remove a crashed CLI scratch dir. It must leave app sessions
+    /// that are still running, waiting on Keep/Discard, or named in `preserving`.
+    @Test func cleanKeepsRecoverableGUISessions() throws {
+        let fm = FileManager.default
+        let paths = Paths(root: testDir("clean-scratch"))
+        let cli = paths.scratchRoot.appending(path: "cli-crash", directoryHint: .isDirectory)
+        let stalePID = paths.scratchRoot.appending(path: "stale-pid", directoryHint: .isDirectory)
+        let pending = paths.scratchRoot.appending(path: "pending", directoryHint: .isDirectory)
+        let running = paths.scratchRoot.appending(path: "running", directoryHint: .isDirectory)
+        let held = paths.scratchRoot.appending(path: "held", directoryHint: .isDirectory)
+        for dir in [cli, stalePID, pending, running, held] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data("disk").write(to: dir.appending(path: "disk.qcow2"))
+        }
+        try "\(ProcessInfo.processInfo.processIdentifier)\n".write(
+            to: stalePID.appending(path: "qemu.pid"), atomically: true, encoding: .utf8
+        )
+        try saveThrowawayInfo(ThrowawayInfo(dir: pending, imagePath: nil, defaultName: "pending", live: false))
+        markThrowawayPending(pending)
+        try saveThrowawayInfo(ThrowawayInfo(dir: running, imagePath: nil, defaultName: "running", live: false))
+
+        let (n, _) = cleanLeftoverScratch(paths, preserving: [held])
+        #expect(n == 2)
+        #expect(!fm.fileExists(atPath: cli.path))
+        #expect(!fm.fileExists(atPath: stalePID.path))
+        #expect(read(pending.appending(path: "disk.qcow2")) == "disk")
+        #expect(readConfigKey(throwawayInfoFile(pending), "state") == guiSessionPending)
+        #expect(read(running.appending(path: "disk.qcow2")) == "disk")
+        #expect(readConfigKey(throwawayInfoFile(running), "state") == guiSessionRunning)
+        #expect(read(held.appending(path: "disk.qcow2")) == "disk")
     }
 }

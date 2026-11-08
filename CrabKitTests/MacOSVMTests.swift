@@ -239,6 +239,48 @@ struct MacOSVMTests {
         #expect(summary.contains("NAT"))
     }
 
+    @Test func ipswSymlinkIsListedAsTheLink() throws {
+        let fm = FileManager.default
+        let root = testDir("ipsw-link")
+        let paths = Paths(root: root)
+        try fm.createDirectory(at: paths.searchDir, withIntermediateDirectories: true)
+        let target = root.appending(path: "UniversalMac_15.2_24C101_Restore.ipsw")
+        try Data("ipsw-bytes".utf8).write(to: target)
+        let link = paths.searchDir.appending(path: "shortcut.ipsw")
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let listed = listImagePaths(paths)
+        #expect(listed.map(\.lastPathComponent) == ["shortcut.ipsw"])
+        #expect(isSymlink(listed[0]))
+        #expect(pathOpenedForBoot(listed[0]).lastPathComponent == target.lastPathComponent)
+        let entries = listImageEntries(paths)
+        #expect(entries[0].fileInfo == "macOS restore image")
+        #expect(entries[0].path == listed[0])
+        #expect(entries[0].sizeKB == diskKB(target))
+
+        try removeImageEntry(listed[0])
+        #expect(!fm.fileExists(atPath: link.path))
+        #expect(try Data(contentsOf: target) == Data("ipsw-bytes".utf8))
+    }
+
+    /// A macOS throwaway keeps its gui-session marker until Keep or Discard
+    /// finishes, so cleanup must not remove it the way it removes a crashed CLI scratch dir.
+    @Test func cleanKeepsMacOSGUISessions() throws {
+        let fm = FileManager.default
+        let paths = Paths(root: testDir("macos-clean"))
+        let scratch = paths.scratchRoot.appending(path: "mac", directoryHint: .isDirectory)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        try Data("disk").write(to: scratch.appending(path: "Disk.img"))
+        try "backend=vz\n".write(to: scratch.appending(path: "vm.conf"), atomically: true, encoding: .utf8)
+        try saveThrowawayInfo(ThrowawayInfo(dir: scratch, imagePath: URL(filePath: "/tmp/a.ipsw"), defaultName: "mac", live: false))
+        markThrowawayPending(scratch)
+
+        let (n, _) = cleanLeftoverScratch(paths)
+        #expect(n == 0)
+        #expect(fm.fileExists(atPath: scratch.appending(path: "Disk.img").path))
+        #expect(read(throwawayInfoFile(scratch)).contains("state=pending"))
+    }
+
     @Test func sha1MatchesAppleDigest() throws {
         let url = testDir("sha1").appending(path: "abc")
         try Data("abc".utf8).write(to: url)

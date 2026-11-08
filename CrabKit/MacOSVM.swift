@@ -791,11 +791,13 @@ public func launchMacOSInstaller(_ paths: Paths, _ opts: BootOptions, image: URL
         throw CrabError("-l doesn't apply to a macOS restore image: installing macOS needs a disk. Drop -l, or use -k to keep the VM.")
     }
     var name = ""
+    // Keep the directory entry. The app opens pathOpenedForBoot; a later
+    // trash of this path removes a symlink and not the IPSW it points at.
+    let entry = imageEntryPath(image)
     if opts.keep {
-        let fallback = defaultVMName(image, arch: "arm64")
+        let fallback = defaultVMName(pathOpenedForBoot(entry), arch: "arm64")
         let input = promptLine("VM name [\(fallback)]: ") ?? ""
-        name = input.trimmed.isEmpty ? fallback : input.trimmed
-        try checkName(name)
+        name = try resolvedKeepName(input, defaultName: fallback)
         let dest = paths.vmRoot.appending(path: name, directoryHint: .isDirectory)
         if dest.exists {
             throw CrabError("there's already something called '\(name)' in \(paths.vmRoot.path)")
@@ -803,7 +805,7 @@ public func launchMacOSInstaller(_ paths: Paths, _ opts: BootOptions, image: URL
     }
     let request = MacOSLaunchRequest(
         kind: .install,
-        image: absPath(image).path,
+        image: entry.path,
         mem: opts.mem ?? "",
         cpus: opts.cpus ?? "",
         disk: opts.diskSize ?? "",

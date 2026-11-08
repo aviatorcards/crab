@@ -157,10 +157,114 @@ public func fmtKB(_ kb: Int) -> String {
 }
 
 /// An absolute path with symlinks resolved; relative paths are taken from
-/// the current directory.
+/// the current directory. For images, delete and trash the `imageEntryPath`
+/// and open `pathOpenedForBoot`: resolving here and then deleting that path
+/// removes the file a symlink points at.
 public func absPath(_ url: URL) -> URL {
     let absolute = url.absoluteURL.standardizedFileURL
     return absolute.exists ? absolute.resolvingSymlinksInPath() : absolute
+}
+
+/// Absolute path of a directory entry. `.` and `..` are removed lexically
+/// and symlinks are left in place, so unlinking this path removes a link
+/// and not its target.
+public func imageEntryPath(_ url: URL) -> URL {
+    let path = url.path
+    let absolute: String
+    if path.hasPrefix("/") {
+        absolute = path
+    } else {
+        let cwd = FileManager.default.currentDirectoryPath
+        absolute = cwd.hasSuffix("/") ? cwd + path : cwd + "/" + path
+    }
+    let normalized = lexicalNormalize(absolute)
+    if normalized == path {
+        return url
+    }
+    return URL(filePath: normalized)
+}
+
+/// The file QEMU should open. A symlink is resolved to its target; any other
+/// path is left as the directory entry so non-link arguments stay stable.
+public func pathOpenedForBoot(_ url: URL) -> URL {
+    let entry = imageEntryPath(url)
+    guard isSymlink(entry) else {
+        if url.path.hasPrefix("/") && !url.path.contains("/./") && !url.path.contains("/../")
+            && !url.path.hasSuffix("/.") && !url.path.hasSuffix("/..") {
+            return url
+        }
+        return entry
+    }
+    return resolveSymlink(entry)
+}
+
+func isSymlink(_ url: URL) -> Bool {
+    var st = stat()
+    return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK
+}
+
+/// `realpath` of a symlink. On failure the link itself is returned; opening
+/// that still follows it, and it is never used as a path to delete.
+func resolveSymlink(_ url: URL) -> URL {
+    guard let cstr = realpath(url.path, nil) else { return url }
+    defer { free(cstr) }
+    return URL(filePath: String(cString: cstr))
+}
+
+func lexicalNormalize(_ absolute: String) -> String {
+    var parts: [String] = []
+    for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
+        if part == "." {
+            continue
+        }
+        if part == ".." {
+            if !parts.isEmpty {
+                parts.removeLast()
+            }
+            continue
+        }
+        parts.append(String(part))
+    }
+    if parts.isEmpty {
+        return "/"
+    }
+    return "/" + parts.joined(separator: "/")
+}
+
+/// Removes a file or symlink. `unlink` deletes the directory entry, so a
+/// symlink is removed and the file it points at is left alone.
+public func removeImageEntry(_ url: URL) throws(CrabError) {
+    let entry = imageEntryPath(url)
+    var st = stat()
+    guard lstat(entry.path, &st) == 0 else {
+        throw CrabError("failed to delete \(entry.path): \(String(cString: strerror(errno)))")
+    }
+    let kind = st.st_mode & S_IFMT
+    guard kind == S_IFLNK || kind == S_IFREG else {
+        throw CrabError("refusing to delete \(entry.path): not a file")
+    }
+    if unlink(entry.path) != 0 {
+        throw CrabError("failed to delete \(entry.path): \(String(cString: strerror(errno)))")
+    }
+}
+
+/// Moves a file or symlink to the Trash. The path is the directory entry:
+/// a symlink is trashed and its target is not.
+public func trashImageEntry(_ url: URL) throws(CrabError) {
+    let entry = imageEntryPath(url)
+    var st = stat()
+    guard lstat(entry.path, &st) == 0 else {
+        throw CrabError("failed to trash \(entry.path): \(String(cString: strerror(errno)))")
+    }
+    let kind = st.st_mode & S_IFMT
+    guard kind == S_IFLNK || kind == S_IFREG else {
+        throw CrabError("refusing to trash \(entry.path): not a file")
+    }
+    do {
+        try FileManager.default.trashItem(at: entry, resultingItemURL: nil)
+    } catch {
+        throw CrabError("failed to trash \(entry.path): \(error.localizedDescription)")
+    }
 }
 
 public func fileMtime(_ url: URL) -> Int {
@@ -209,7 +313,9 @@ public func logImageBoot(_ paths: Paths, _ image: URL, dryRun: Bool) {
         return
     }
     try? FileManager.default.createDirectory(at: paths.vmRoot, withIntermediateDirectories: true)
-    let line = Data("\(nowSecs())\t\(image.path)\n".utf8)
+    // Record the directory entry. Older crabs stored a symlink-resolved path;
+    // imageLastBoot still matches those.
+    let line = Data("\(nowSecs())\t\(imageEntryPath(image).path)\n".utf8)
     if let handle = try? FileHandle(forWritingTo: paths.history) {
         defer { try? handle.close() }
         _ = try? handle.seekToEnd()
@@ -219,13 +325,25 @@ public func logImageBoot(_ paths: Paths, _ image: URL, dryRun: Bool) {
     }
 }
 
+/// Paths a history line might use for this image: the directory entry, and
+/// (for lines written by older crabs) the symlink-resolved path. The resolved
+/// path is only for matching, never for deletion.
+func imageHistoryKeys(_ image: URL) -> Set<String> {
+    let entry = imageEntryPath(image)
+    var keys: Set<String> = [image.path, entry.path, pathOpenedForBoot(image).path]
+    if entry.exists {
+        keys.insert(entry.resolvingSymlinksInPath().path)
+    }
+    return keys
+}
+
 public func imageLastBoot(_ paths: Paths, _ image: URL) -> Int? {
     guard let content = try? String(contentsOf: paths.history, encoding: .utf8) else { return nil }
-    let target = image.path
+    let targets = imageHistoryKeys(image)
     var last: Int?
     for line in content.lines {
         let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-        if parts.count == 2, parts[1] == target, let t = Int(parts[0]) {
+        if parts.count == 2, targets.contains(String(parts[1])), let t = Int(parts[0]) {
             last = t
         }
     }
@@ -253,16 +371,19 @@ public struct ImageEntry: Sendable, Hashable, Identifiable {
 
 /// The .iso files in the search folder, then the .img files, then macOS
 /// restore images (`.ipsw`), each sorted by path.
+/// Each path is the directory entry. A symlink is listed as the link, so
+/// deleting it does not delete the file it points at.
 public func listImagePaths(_ paths: Paths) -> [URL] {
     let entries = (try? FileManager.default.contentsOfDirectory(at: paths.searchDir, includingPropertiesForKeys: nil)) ?? []
     var isos: [URL] = []
     var imgs: [URL] = []
     var ipsws: [URL] = []
     for url in entries where url.isFile {
-        switch url.pathExtension.lowercased() {
-        case "iso": isos.append(absPath(url))
-        case "img": imgs.append(absPath(url))
-        case "ipsw": ipsws.append(absPath(url))
+        let entry = imageEntryPath(url)
+        switch entry.pathExtension.lowercased() {
+        case "iso": isos.append(entry)
+        case "img": imgs.append(entry)
+        case "ipsw": ipsws.append(entry)
         default: break
         }
     }
@@ -302,12 +423,15 @@ public func extractQuotedLabel(_ fileOutput: String) -> String {
 
 public func listImageEntries(_ paths: Paths) -> [ImageEntry] {
     listImagePaths(paths).map { url in
-        let info = isIPSW(url) ? "macOS restore image" : extractQuotedLabel(fileBrief(url))
+        // Size follows the symlink so a link to an ISO or IPSW still shows
+        // the file's size. `path` stays the directory entry that delete and trash use.
+        let opened = pathOpenedForBoot(url)
+        let info = isIPSW(url) ? "macOS restore image" : extractQuotedLabel(fileBrief(opened))
         return ImageEntry(
             path: url,
             name: url.lastPathComponent,
-            sizeHuman: humanSize(url),
-            sizeKB: diskKB(url),
+            sizeHuman: humanSize(opened),
+            sizeKB: diskKB(opened),
             downloadedSecs: fileBirthtime(url),
             lastBootedSecs: imageLastBoot(paths, url),
             fileInfo: info
