@@ -171,7 +171,9 @@ public func usageText(_ paths: Paths) -> String {
     PowerPC Mac (ppc: Mac OS 9, Mac OS X up to 10.5) and SPARC64 (sparc64: Sun Ultra 5) guests.
 
     macOS (Apple Silicon only): crab get macos downloads Apple's latest restore
-    image and opens Crab to install it with Virtualization.framework. Those VMs
+    image and opens Crab to install it with Virtualization.framework.
+    crab get macos/list shows every published version; crab get macos/15.6 (or a
+    build like macos/24G84, or just macos/15) gets an older one. Those VMs
     live in the same folder as QEMU VMs (Disk.img, not disk.qcow2). They have no
     snapshots and no SSH port forward. QEMU can't run current macOS, and neither
     can an Intel Mac.

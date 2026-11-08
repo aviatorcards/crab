@@ -10,11 +10,7 @@ func fetchLatestSupportedMacOSRestore() async -> MacOSRestoreChoice? {
         return nil
     }
     do {
-        let image: VZMacOSRestoreImage = try await withCheckedThrowingContinuation { cont in
-            VZMacOSRestoreImage.fetchLatestSupported { result in
-                cont.resume(with: result)
-            }
-        }
+        let image = try await VZMacOSRestoreImage.latestSupported
         return MacOSRestoreChoice(
             version: macosRestoreVersion(image),
             build: image.buildVersion,
@@ -239,7 +235,11 @@ public final class MacOSGuest {
         }
         message = "Shutting down…"
         if virtualMachine.canRequestStop {
-            virtualMachine.requestStop()
+            do {
+                try virtualMachine.requestStop()
+            } catch {
+                Task { await forceStop() }
+            }
         } else {
             Task { await forceStop() }
         }
@@ -469,11 +469,7 @@ public final class MacOSGuest {
 
     private func loadRestoreImage(_ url: URL) async throws(CrabError) -> VZMacOSRestoreImage {
         do {
-            return try await withCheckedThrowingContinuation { cont in
-                VZMacOSRestoreImage.load(from: url) { result in
-                    cont.resume(with: result)
-                }
-            }
+            return try await VZMacOSRestoreImage.image(from: url)
         } catch {
             throw CrabError("couldn't read \(url.lastPathComponent): \(error.localizedDescription)")
         }

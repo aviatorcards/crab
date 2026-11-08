@@ -9,6 +9,10 @@ public let macosVariant = "restore"
 /// The hardware model Apple's Virtualization framework installs, in the IPSW feed.
 public let macosVirtualMachineModel = "VirtualMac2,1"
 public let macosIPSWCatalogURL = "https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml"
+/// Every `VirtualMac2,1` restore image Apple has published. Apple's own feed
+/// only lists the current one; this index (the one Mist uses) keeps the rest.
+/// The files themselves still come from Apple's CDN.
+public let macosIPSWHistoryURL = "https://api.ipsw.me/v4/device/\(macosVirtualMachineModel)?type=ipsw"
 
 public let vmBackendVZ = "vz"
 public let vmBackendQEMU = "qemu"
@@ -49,13 +53,15 @@ public struct MacOSIPSWAsset: Sendable, Equatable {
     public var url: String
     public var sha1: String
     public var device: String
+    public var sha256: String
 
-    public init(version: String, build: String, url: String, sha1: String, device: String) {
+    public init(version: String, build: String, url: String, sha1: String, device: String, sha256: String = "") {
         self.version = version
         self.build = build
         self.url = url
         self.sha1 = sha1
         self.device = device
+        self.sha256 = sha256
     }
 }
 
@@ -110,22 +116,83 @@ public func parseMacOSIPSWCatalog(_ data: Data, device: String = macosVirtualMac
             best[asset.version] = asset
         }
     }
-    return best.values.sorted { lhs, rhs in
+    return newestFirst(Array(best.values))
+}
+
+/// Reads ipsw.me's firmware list for the virtual Mac. Only files on Apple's
+/// own servers are kept, so the index can't point a download anywhere else.
+public func parseIPSWHistory(_ data: Data, device: String = macosVirtualMachineModel) -> [MacOSIPSWAsset] {
+    struct Device: Decodable {
+        struct Firmware: Decodable {
+            var identifier: String?
+            var version: String
+            var buildid: String
+            var url: String
+            var sha1sum: String?
+            var sha256sum: String?
+        }
+        var firmwares: [Firmware]
+    }
+    guard let list = try? JSONDecoder().decode(Device.self, from: data) else { return [] }
+    var best: [String: MacOSIPSWAsset] = [:]
+    for item in list.firmwares where (item.identifier ?? device) == device
+        && !item.version.isEmpty
+        && isAppleDownloadURL(item.url)
+        && item.url.lowercased().hasSuffix(".ipsw") {
+        let asset = MacOSIPSWAsset(
+            version: item.version, build: item.buildid, url: item.url,
+            sha1: item.sha1sum ?? "", device: device, sha256: item.sha256sum ?? ""
+        )
+        if let existing = best[asset.version], !appleBuildIsNewer(asset.build, than: existing.build) {
+            continue
+        }
+        best[asset.version] = asset
+    }
+    return newestFirst(Array(best.values))
+}
+
+/// Apple's feed and the history list together, one image per version. Apple's
+/// entry wins where both list a version; the history fills in its checksums
+/// when it's the same file.
+public func mergeMacOSAssets(apple: [MacOSIPSWAsset], history: [MacOSIPSWAsset]) -> [MacOSIPSWAsset] {
+    var byVersion: [String: MacOSIPSWAsset] = [:]
+    for asset in history {
+        byVersion[asset.version] = asset
+    }
+    for var asset in apple {
+        if let known = history.first(where: { $0.url == asset.url }) {
+            if asset.sha1.isEmpty { asset.sha1 = known.sha1 }
+            if asset.sha256.isEmpty { asset.sha256 = known.sha256 }
+        }
+        byVersion[asset.version] = asset
+    }
+    return newestFirst(Array(byVersion.values))
+}
+
+/// An https URL on apple.com or one of its subdomains (updates.cdn-apple.com
+/// is where restore images live).
+func isAppleDownloadURL(_ raw: String) -> Bool {
+    guard let url = URL(string: raw), url.scheme == "https", let host = url.host()?.lowercased() else { return false }
+    return ["apple.com", "cdn-apple.com"].contains { host == $0 || host.hasSuffix(".\($0)") }
+}
+
+private func newestFirst(_ assets: [MacOSIPSWAsset]) -> [MacOSIPSWAsset] {
+    assets.sorted { lhs, rhs in
         let lv = versionKey(lhs.version)
         let rv = versionKey(rhs.version)
-        if lv != rv { return lv > rv }
+        if lv != rv { return rv.lexicographicallyPrecedes(lv) }
         return appleBuildIsNewer(lhs.build, than: rhs.build)
     }
 }
 
-/// Catalog rows for the macOS restore images. Checksums are SHA-1 (Apple
-/// doesn't publish SHA-256 for these). `display` is `window` because the
+/// Catalog rows for the macOS restore images. Apple's feed gives SHA-1 at
+/// most; the history list adds SHA-256. `display` is `window` because the
 /// guest always has a graphical console.
 public func macOSCatalogEntries(_ assets: [MacOSIPSWAsset]) -> [CatalogEntry] {
     assets.map { asset in
         CatalogEntry(
             distro: macosDistro, variant: macosVariant, version: asset.version, arch: "arm64",
-            url: asset.url, sha256: "", display: "window", sha1: asset.sha1
+            url: asset.url, sha256: asset.sha256, display: "window", sha1: asset.sha1
         )
     }
 }
@@ -234,12 +301,34 @@ public func selectMacOSRestore(catalog: [CatalogEntry], supported: MacOSRestoreC
         return supported
     }
     let entries = catalog.filter { $0.distro == macosDistro && $0.arch == "arm64" && !$0.url.isEmpty }
-    guard let best = entries.max(by: { versionKey($0.version) < versionKey($1.version) }) else { return nil }
+    guard let best = entries.max(by: { versionKey($0.version).lexicographicallyPrecedes(versionKey($1.version)) }) else { return nil }
     return MacOSRestoreChoice(
         version: best.version,
         build: macosBuildFromIPSWName(best.url) ?? "",
         url: best.url
     )
+}
+
+/// The newest restore image of each major macOS version, newest first. The
+/// release list keeps every build, which is too many to show by default.
+public func newestMacOSPerMajor(_ entries: [CatalogEntry]) -> [CatalogEntry] {
+    var seen = Set<Substring>()
+    return entries
+        .filter { $0.distro == macosDistro }
+        .sorted { versionKey($1.version).lexicographicallyPrecedes(versionKey($0.version)) }
+        .filter { seen.insert($0.version.split(separator: ".").first ?? "").inserted }
+}
+
+/// The image a `crab get macos/QUERY` names: an exact version (`15.6`), a
+/// build (`24G84`), or a version prefix (`15`, `14.6`) for the newest match.
+public func findMacOSRestore(catalog: [CatalogEntry], query: String) -> MacOSRestoreChoice? {
+    let wanted = query.lowercased()
+    let entries = catalog.filter { $0.distro == macosDistro && $0.arch == "arm64" && !$0.url.isEmpty }
+    // An exact version or build beats a prefix: macos/14.6 is 14.6, not 14.6.1.
+    let exact = entries.filter { $0.version == wanted || macosBuildFromIPSWName($0.url)?.lowercased() == wanted }
+    let matches = exact.isEmpty ? entries.filter { $0.version.hasPrefix(wanted + ".") } : exact
+    guard let best = matches.max(by: { versionKey($0.version).lexicographicallyPrecedes(versionKey($1.version)) }) else { return nil }
+    return MacOSRestoreChoice(version: best.version, build: macosBuildFromIPSWName(best.url) ?? "", url: best.url)
 }
 
 public func sha1ForMacOSRestore(_ choice: MacOSRestoreChoice, catalog: [CatalogEntry]) -> String {
@@ -867,30 +956,45 @@ public func cmdGetMacOS(_ paths: Paths, _ opts: BootOptions, variant: String) as
     if let reason = macosGuestRefusal(hostArchitecture: hostArch()) {
         throw CrabError(reason)
     }
-    guard variant == macosVariant else {
-        throw CrabError("macOS only has the \(macosVariant) image (crab get macos).")
-    }
     let arch = opts.arch.flatMap { $0.isEmpty ? nil : $0 } ?? hostArch()
     if arch != "arm64" {
         throw CrabError("macOS restore images are arm64 only. Drop -a \(arch).")
     }
     let catalog = loadCatalog(paths)
+    if variant == "list" {
+        cmdListMacOS(paths, catalog: catalog)
+        return
+    }
     let supported = await fetchLatestSupportedMacOSRestore()
-    guard let choice = selectMacOSRestore(catalog: catalog, supported: supported) else {
-        throw CrabError("no macOS restore image in the release list. Run crab sync and try again.")
+    let choice: MacOSRestoreChoice
+    if variant == macosVariant {
+        guard let latest = selectMacOSRestore(catalog: catalog, supported: supported) else {
+            throw CrabError("no macOS restore image in the release list. Run crab sync and try again.")
+        }
+        choice = latest
+    } else {
+        guard let found = findMacOSRestore(catalog: catalog, query: variant) else {
+            throw CrabError("no macOS \(variant) in the release list. crab get macos/list shows the versions there are (crab sync to refresh).")
+        }
+        choice = found
     }
     let file = getFilename(distro: macosDistro, arch: "arm64", url: choice.url)
     let build = choice.build.isEmpty ? "" : " (\(choice.build))"
     print("macos/\(macosVariant) \(choice.version)\(build) for arm64")
-    if supported != nil {
+    if variant == macosVariant, supported != nil {
         print("This Mac's Virtualization framework asked for this restore image.")
+    } else if let supported, !supported.version.isEmpty,
+              versionKey(supported.version).lexicographicallyPrecedes(versionKey(choice.version)) {
+        print("This Mac's Virtualization framework offers \(supported.version); a newer guest may not install on this host.")
     }
+    let entry = catalog.first { $0.url == choice.url }
+    let sha256 = entry?.sha256 ?? ""
     let sha1 = sha1ForMacOSRestore(choice, catalog: catalog)
-    if sha1.isEmpty {
-        print("Apple didn't publish a SHA-1 for this image. The installer rejects a damaged one.")
+    if sha256.isEmpty && sha1.isEmpty {
+        print("No checksum was published for this image. The installer rejects a damaged one.")
     }
     let image = try await downloadImage(
-        paths, url: choice.url, sha256: "", file: file, dryRun: opts.dryRun,
+        paths, url: choice.url, sha256: sha256, file: file, dryRun: opts.dryRun,
         cancel: CancelFlag(), report: terminalReport(), sha1: sha1
     )
     if opts.downloadOnly || opts.dryRun {
@@ -905,4 +1009,20 @@ public func cmdGetMacOS(_ paths: Paths, _ opts: BootOptions, variant: String) as
     }
     print()
     try launchMacOSInstaller(paths, opts, image: image)
+}
+
+/// Every macOS version in the release list, for `crab get macos/list`.
+func cmdListMacOS(_ paths: Paths, catalog: [CatalogEntry]) {
+    let entries = catalog.filter { $0.distro == macosDistro && $0.arch == "arm64" }
+    if entries.isEmpty {
+        print("No macOS restore images in the release list. Run crab sync and try again.")
+        return
+    }
+    print("macOS restore images for the virtual Mac, newest first (crab get macos/VERSION or macos/BUILD):")
+    for entry in entries {
+        let file = getFilename(distro: entry.distro, arch: entry.arch, url: entry.url)
+        let build = macosBuildFromIPSWName(entry.url) ?? ""
+        let mark = paths.searchDir.appending(path: file).isFile ? "(downloaded)" : ""
+        print("  \(entry.version.padded(9)) \(build.padded(9)) \(file.padded(46)) \(mark)")
+    }
 }

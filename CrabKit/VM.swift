@@ -276,13 +276,13 @@ public func cmdImages(_ paths: Paths) {
 public func cleanLeftoverScratch(_ paths: Paths, preserving protected: Set<URL> = []) -> (count: Int, freedKB: Int) {
     var n = 0
     var freed = 0
-    let keep = Set(protected.map { imageEntryPath($0).path })
+    let keep = Set(protected.map { $0.resolvingSymlinksInPath().path } + protected.map { imageEntryPath($0).path })
     let entries = (try? FileManager.default.contentsOfDirectory(at: paths.scratchRoot, includingPropertiesForKeys: nil)) ?? []
     for p in entries where p.isDirectory && vmPID(p) == nil {
         // A gui-session file means the app started this VM and has not
         // finished Keep or Discard, including after a crash or quit.
         // Both state=running and state=pending are kept.
-        if scratchIsRecoverable(p) || keep.contains(imageEntryPath(p).path) {
+        if scratchIsRecoverable(p) || keep.contains(p.resolvingSymlinksInPath().path) || keep.contains(imageEntryPath(p).path) {
             continue
         }
         let kb = diskKB(p)

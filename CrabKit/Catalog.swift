@@ -599,10 +599,15 @@ public struct DistroSource: Sendable {
 
 /// The distros in the catalog, in the order they're listed.
 func syncMacOS() async throws(CrabError) -> [CatalogEntry] {
-    let text = try await fetchText(macosIPSWCatalogURL)
-    let assets = parseMacOSIPSWCatalog(Data(text.utf8))
+    // Apple's feed has the current image; the history list has the older
+    // ones. Either is enough on its own.
+    async let appleText = try? await fetchText(macosIPSWCatalogURL)
+    async let historyText = try? await fetchText(macosIPSWHistoryURL)
+    let apple = await appleText.map { parseMacOSIPSWCatalog(Data($0.utf8)) } ?? []
+    let history = await historyText.map { parseIPSWHistory(Data($0.utf8)) } ?? []
+    let assets = mergeMacOSAssets(apple: apple, history: history)
     if assets.isEmpty {
-        throw CrabError("Apple's restore feed had no image for \(macosVirtualMachineModel)")
+        throw CrabError("couldn't find any restore image for \(macosVirtualMachineModel)")
     }
     return macOSCatalogEntries(assets)
 }
@@ -673,7 +678,13 @@ public func cmdSync(_ paths: Paths) async throws(CrabError) {
     for d in distros {
         print("  \(d.padded(10)) ", terminator: "")
         if let list = found[d], !list.isEmpty {
-            print(Set(list.map(\.version)).sorted().joined(separator: " ") + " ")
+            if d == macosDistro {
+                // Every build Apple has published; name the newest of each major.
+                let shown = newestMacOSPerMajor(list).map(\.version)
+                print(shown.joined(separator: " ") + " (\(list.count) builds) ")
+            } else {
+                print(Set(list.map(\.version)).sorted().joined(separator: " ") + " ")
+            }
             newEntries += list
         } else {
             print("couldn't check; keeping what the catalog had")
@@ -1426,13 +1437,15 @@ private final class TerminalProgress: @unchecked Sendable {
 
 public func cmdGetList(_ paths: Paths, arch: String) {
     print("Available for \(arch), last checked \(fmtAge(fileMtime(paths.catalog))) (crab sync to refresh, -a for other architectures):")
-    for entry in loadCatalog(paths) where entry.arch == arch {
+    let catalog = loadCatalog(paths).filter { $0.arch == arch }
+    let macos = newestMacOSPerMajor(catalog)
+    for entry in catalog where entry.distro != macosDistro || macos.contains(entry) {
         let file = getFilename(distro: entry.distro, arch: entry.arch, url: entry.url)
         var marks: [String] = []
         if paths.searchDir.appending(path: file).isFile {
             marks.append("downloaded")
         }
-        if entry.variant == defaultVariant(entry.distro) {
+        if entry.variant == defaultVariant(entry.distro) && (entry.distro != macosDistro || entry == macos.first) {
             marks.append("default")
         }
         if entry.sha256.isEmpty && entry.sha1.isEmpty {
@@ -1440,6 +1453,10 @@ public func cmdGetList(_ paths: Paths, arch: String) {
         }
         let markStr = marks.isEmpty ? "" : "(\(marks.joined(separator: ", ")))"
         print("  \("\(entry.distro)/\(entry.variant)".padded(22)) \(entry.version.padded(9)) \(file.padded(46)) \(markStr)")
+    }
+    let older = catalog.filter { $0.distro == macosDistro }.count - macos.count
+    if older > 0 {
+        print("  (\(older) more macOS builds: crab get macos/list, then crab get macos/VERSION)")
     }
 }
 

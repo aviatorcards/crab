@@ -89,6 +89,55 @@ struct MacOSVMTests {
         #expect(selectMacOSRestore(catalog: [], supported: nil) == nil)
     }
 
+    private let historyJSON = """
+    {"identifier":"VirtualMac2,1","firmwares":[
+      {"identifier":"VirtualMac2,1","version":"15.2","buildid":"24C101","sha1sum":"abc123","sha256sum":"s152",
+       "url":"https://updates.cdn-apple.com/x/UniversalMac_15.2_24C101_Restore.ipsw","signed":false},
+      {"identifier":"VirtualMac2,1","version":"14.6.1","buildid":"23G93","sha1sum":"c1","sha256sum":"s1461",
+       "url":"https://updates.cdn-apple.com/z/UniversalMac_14.6.1_23G93_Restore.ipsw","signed":false},
+      {"identifier":"VirtualMac2,1","version":"14.6","buildid":"23G80","sha1sum":"c2","sha256sum":"s146",
+       "url":"https://updates.cdn-apple.com/w/UniversalMac_14.6_23G80_Restore.ipsw","signed":false},
+      {"identifier":"VirtualMac2,1","version":"13.6","buildid":"22G120","sha1sum":"c3","sha256sum":"s136",
+       "url":"https://example.com/UniversalMac_13.6_22G120_Restore.ipsw","signed":false},
+      {"identifier":"VirtualMac2,1","version":"13.5","buildid":"22G74","sha1sum":"c4","sha256sum":"s135",
+       "url":"http://updates.cdn-apple.com/v/UniversalMac_13.5_22G74_Restore.ipsw","signed":false}
+    ]}
+    """
+
+    @Test func historyKeepsOnlyApplesServersAndMergesWithTheFeed() throws {
+        let history = parseIPSWHistory(Data(historyJSON.utf8))
+        // 13.6 is on another host and 13.5 is plain http, so both are dropped.
+        #expect(history.map(\.version) == ["15.2", "14.6.1", "14.6"])
+        #expect(history[1].sha256 == "s1461")
+        #expect(parseIPSWHistory(Data("{}".utf8)).isEmpty)
+
+        let merged = mergeMacOSAssets(apple: parseMacOSIPSWCatalog(try catalogData()), history: history)
+        #expect(merged.map(\.version) == ["15.2", "15.1", "14.6.1", "14.6"])
+        // Apple's 15.2 is the same file as the history's, so it picks up SHA-256.
+        #expect(merged[0].sha256 == "s152")
+        #expect(merged[1].sha256.isEmpty)
+        let entries = macOSCatalogEntries(merged)
+        #expect(entries[2].sha256 == "s1461")
+        #expect(CatalogEntry(tsvLine: entries[2].tsvLine) == entries[2])
+    }
+
+    @Test func versionQueriesAndNewestPerMajor() throws {
+        let catalog = macOSCatalogEntries(mergeMacOSAssets(
+            apple: parseMacOSIPSWCatalog(try catalogData()),
+            history: parseIPSWHistory(Data(historyJSON.utf8))
+        ))
+        #expect(findMacOSRestore(catalog: catalog, query: "14")?.version == "14.6.1")
+        #expect(findMacOSRestore(catalog: catalog, query: "14.6")?.version == "14.6")
+        #expect(findMacOSRestore(catalog: catalog, query: "23g80")?.build == "23G80")
+        #expect(findMacOSRestore(catalog: catalog, query: "15")?.version == "15.2")
+        #expect(findMacOSRestore(catalog: catalog, query: "1") == nil)
+        #expect(findMacOSRestore(catalog: catalog, query: "12") == nil)
+        #expect(newestMacOSPerMajor(catalog).map(\.version) == ["15.2", "14.6.1"])
+        #expect(isAppleDownloadURL("https://updates.cdn-apple.com/a.ipsw"))
+        #expect(!isAppleDownloadURL("https://updates.cdn-apple.com.evil.test/a.ipsw"))
+        #expect(!isAppleDownloadURL("https://notapple.com/a.ipsw"))
+    }
+
     @Test func namesAndRefusal() {
         let url = "https://updates.cdn-apple.com/x/UniversalMac_15.2_24C101_Restore.ipsw"
         #expect(getFilename(distro: "macos", arch: "arm64", url: url) == "UniversalMac_15.2_24C101_Restore.ipsw")
@@ -216,9 +265,9 @@ struct MacOSVMTests {
         try FileManager.default.createDirectory(at: aux, withIntermediateDirectories: true)
         try Data("nvram").write(to: aux.appending(path: "contents"))
         let copy = try cloneVM(paths, "sequoia", "copy")
-        #expect(Data(contentsOf: copy.appending(path: "Disk.img")).count == 2 * 1024 * 1024)
-        #expect(Data(contentsOf: copy.appending(path: "HardwareModel")) == Data("hw".utf8))
-        #expect(Data(contentsOf: copy.appending(path: "AuxiliaryStorage").appending(path: "contents")) == Data("nvram".utf8))
+        #expect(try Data(contentsOf: copy.appending(path: "Disk.img")).count == 2 * 1024 * 1024)
+        #expect(try Data(contentsOf: copy.appending(path: "HardwareModel")) == Data("hw".utf8))
+        #expect(try Data(contentsOf: copy.appending(path: "AuxiliaryStorage").appending(path: "contents")) == Data("nvram".utf8))
         #expect(isMacOSVM(copy))
     }
 

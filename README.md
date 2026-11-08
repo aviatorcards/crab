@@ -6,7 +6,7 @@ Try out OS images on your Mac (Apple Silicon or Intel) in throwaway QEMU VMs, ke
 
 ## Features
 
-- **Throwaway VMs by default:** Point `crab` at an `.iso` or `.img`, or pick one from a menu of `~/Downloads` and `~/VMs`. When QEMU exits, `crab` asks whether to keep it—say no and both the VM and (optionally) the ISO are trashed. The question is asked for every throwaway that had a disk; the size is only shown so you can decide.
+- **Throwaway VMs by default:** Point `crab` at an `.iso` or `.img`, or pick one from a menu of `~/Downloads` and `~/VMs`. When QEMU exits, `crab` asks whether to keep it—say no and both the VM and (optionally) the ISO are trashed. The question is asked for every throwaway that had a disk; the size is only shown so you can decide. Recoverable sessions (waiting on Keep or Discard, or left behind after a quit/crash) are preserved safely in `~/.scratch/` until explicitly resolved.
 - **CLI & Mac App:** Run `crab` in the terminal for classic numbered menus and flags, or open **Crab.app** (or run `crab gui`) to browse and manage VMs, snapshots, local ISOs, and distro downloads.
 - **Built-in Release Catalog & Mirror Downloader:** Fetch the latest releases straight from each project's own release index or open directory, with automatic SHA-256 verification and `.part` download resumption—no `jq`, `curl`, `file`, or `du` required:
 
@@ -28,13 +28,15 @@ Try out OS images on your Mac (Apple Silicon or Intel) in throwaway QEMU VMs, ke
   | macOS | `restore` | arm64 (Apple Silicon hosts only) |
 
   Redox and 9front images are packed with zstd and gzip, and are unpacked after download (zstd comes with Homebrew's QEMU). 9front publishes no checksums, so its downloads are marked unverified. macOS restore images are checked against the SHA-1 Apple publishes for the same IPSW, when that checksum is in the feed.
-- **Multi-Architecture (`arm64`, `amd64`, `i386`):**
-  - Automatically detects guest architecture (`arm64`, `amd64`, `i386`) from filenames, ISO 9660 volume labels, embedded UEFI boot loaders (`BOOTAA64.EFI`, `BOOTX64.EFI`, `BOOTIA32.EFI`), the ISO's El Torito boot catalog, or PC floppy boot sectors. Images for other machines (PowerPC, SPARC, 32-bit ARM, `.dmg`) are refused with a clear message.
+- **Multi-Architecture (`arm64`, `amd64`, `i386`, `ppc`, `sparc64`):**
+  - Automatically detects guest architecture (`arm64`, `amd64`, `i386`, `ppc`, `sparc64`) from filenames, ISO 9660 volume labels, embedded UEFI boot loaders (`BOOTAA64.EFI`, `BOOTX64.EFI`, `BOOTIA32.EFI`), the ISO's El Torito boot catalog, Apple partition maps, or PC floppy boot sectors. Images for other machines (32-bit SPARC, MIPS, 32-bit ARM, `.dmg`) are refused with a clear message.
   - PowerPC Mac discs (Mac OS 9, Mac OS X up to 10.5, macppc BSDs) boot as `ppc` guests on QEMU's `mac99` G4 Power Mac with Open Firmware, under emulation.
+  - SPARC64 discs (OpenBSD, NetBSD, Debian SPARC64, ...) boot as `sparc64` guests on QEMU's `sun4u` (Sun Ultra 5) with OpenBIOS, under emulation.
   - Older x86 OSes that can only boot with BIOS (DOS, Windows 9x/XP, ...) get a legacy PC (`-H legacy`: i440fx, IDE, PCnet); newer ones get q35 with AHCI and e1000.
   - Uses Hypervisor.framework (`hvf`) when the guest matches your Mac's architecture, falling back to `tcg` emulation otherwise.
   - Opens guests in QEMU's `cocoa` window and uses the UEFI firmware (`edk2-*`) that ships with Homebrew's QEMU.
   - Attaches real ISO 9660 images as CD-ROMs and hybrid/raw disk images (like OpenBSD `install*.img` or Redox `livedisk.iso`) with a temporary snapshot overlay so the source image is never modified.
+  - Safely handles image symlinks in search folders: trashing or cleaning an image link unlinks the symlink itself without touching or deleting the target file.
 - **Live Installation without Disk**
   `crab` can boot operating systems directly from ISOs or disk images without creating a persistent virtual disk. When you run `crab -l image.iso`, it boots the guest *only for the duration of the session*. The OS installer runs inside a temporary, throwaway VM. Once the installer closes, the VM is deleted, and no trace is left behind. This is perfect for trying out live installers from **Fedora**, **Ubuntu**, **Alpine**, **OpenBSD**, or **Arch** without cluttering your system with virtual hard drives.
   **Niche Operating Systems**
@@ -44,10 +46,11 @@ Try out OS images on your Mac (Apple Silicon or Intel) in throwaway QEMU VMs, ke
   - ReactOS
   - Redox
   - Plan 9/9front
+  - OpenBSD, NetBSD, or Debian on SPARC64 (`sun4u`)
 
 ### SSH and Port Forwards
 
-New VMs get an SSH forward on the first free port from 2222 up (`-p PORT` picks one, `-p 0` turns it off), so `crab ssh NAME` works as soon as the guest runs `sshd`. Host keys are remembered per VM name, not per port. Extra forwards are given with `-P HOST:GUEST` (or `udp:HOST:GUEST`), saved with the VM, and cleared with `-P 0`.
+New VMs get an SSH forward on the first free port from 2222 up (`-p PORT` picks one, `-p 0` turns it off), so `crab ssh NAME` works as soon as the guest runs `sshd`. Host keys are remembered per VM name, not per port. Extra forwards are given with `-P HOST:GUEST` (or `udp:HOST:GUEST`), saved with the VM, and cleared with `-P 0`. SSH logins are hardened against option injection by validating user names and invoking `ssh` with `-l <user>` and `--` before the host.
 
 ### Control Socket
 
@@ -58,14 +61,16 @@ Every VM crab boots gets a QMP control socket at `~/VMs/<name>/qmp.sock`. `crab 
 Current macOS does not run under QEMU here. On an Apple Silicon Mac, `crab` installs it with Apple's Virtualization.framework instead. Intel Macs get a clear refusal: the framework can run Linux on Intel, but it will not install macOS there, and QEMU can't either. Older PowerPC Mac OS X discs (up to 10.5) still boot as `ppc` guests on either Mac.
 
 ```bash
-crab sync                     # the catalog gains a macos/restore row from Apple's IPSW feed
+crab sync                     # the catalog gains macos/restore rows, one per published version
 crab get                      # on Apple Silicon, macOS is listed next to the other arm64 releases
 crab get macos                # download the newest image this Mac can install, then install it
+crab get macos/list           # every restore image Apple has published for the virtual Mac
+crab get macos/15             # the newest 15.x; macos/14.6.1 or a build (macos/23G93) work too
 crab get -d macos             # download only
 crab boot sequoia             # open a saved macOS VM in Crab.app
 ```
 
-`crab get macos` asks `VZMacOSRestoreImage.latestSupported` for the restore image this Mac supports, and falls back to the newest `VirtualMac2,1` entry in Apple's feed (`https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml`) if that call fails. The IPSW is saved in the image folder under Apple's own file name and resumed like any other download. The CLI then hands the install to **Crab.app**, which is the process signed with `com.apple.security.virtualization` and the one that can show `VZVirtualMachineView`. The same window is what you get from **Get Distros** or by booting a `.ipsw` in **Local Images**.
+`crab get macos` asks `VZMacOSRestoreImage.latestSupported` for the restore image this Mac supports, and falls back to the newest `VirtualMac2,1` entry in Apple's feed (`https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml`) if that call fails. Apple's feed only lists the current release, so `crab sync` also reads the `VirtualMac2,1` firmware list from ipsw.me (`https://api.ipsw.me/v4/device/VirtualMac2,1?type=ipsw`), the index Mist uses, for older builds and their SHA-256. Entries from that list are only kept when the file is on Apple's servers (`updates.cdn-apple.com`), so downloads always come from Apple. If either source can't be reached, sync uses the other. Asking for a version newer than this Mac's `latestSupported` prints a warning, because the host may not be able to install it. The IPSW is saved in the image folder under Apple's own file name and resumed like any other download. The CLI then hands the install to **Crab.app**, which is the process signed with `com.apple.security.virtualization` and the one that can show `VZVirtualMachineView`. The same window is what you get from **Get Distros** or by booting a `.ipsw` in **Local Images**.
 
 Installation creates a VM beside the QEMU ones:
 
@@ -104,7 +109,7 @@ xcodebuild -scheme Crab -derivedDataPath build/dd test
 Then, with `VM_ROOT` pointed at a temporary directory if you don't want to touch `~/VMs`:
 
 1. `codesign -d --entitlements :- build/dd/Build/Products/Debug/Crab.app` shows `com.apple.security.virtualization`.
-2. `crab sync`, then `crab get` (host arch arm64) lists `macos/restore` next to the other releases. The app's **Get Distros** page shows the same row.
+2. `crab sync`, then `crab get` (host arch arm64) lists `macos/restore` (the newest build of each major version) next to the other releases. `crab get macos/list` lists every build. The app's **Get Distros** page shows the same rows, with the older builds under **All Builds**.
 3. On an Intel Mac, `crab get macos` refuses before downloading, and names Apple Silicon. PowerPC Mac OS X discs still boot.
 4. `crab get -n macos` prints the IPSW URL and the disk/RAM/CPU plan and does not open a window.
 5. `crab get -d macos` downloads `UniversalMac_…_Restore.ipsw` with a progress bar. Interrupt it and run the command again; the `.part` file resumes. The checksum line reports SHA-1 when Apple published one.
@@ -118,7 +123,7 @@ Then, with `VM_ROOT` pointed at a temporary directory if you don't want to touch
 ## Requirements
 
 - macOS 15 or later, on Apple Silicon or Intel
-- QEMU: `brew install qemu` (not used by macOS guests)
+- QEMU: `brew install qemu` (provides `qemu-system-aarch64`, `qemu-system-x86_64`, `qemu-system-i386`, `qemu-system-ppc`, `qemu-system-sparc64`; not used by macOS guests)
 - macOS guests: an Apple Silicon Mac. The app and the `crab` tool are signed with `com.apple.security.virtualization` (ad-hoc signing is enough locally)
 - To build: Xcode 26 or later, and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
 

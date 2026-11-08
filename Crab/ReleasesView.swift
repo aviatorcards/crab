@@ -23,8 +23,12 @@ struct ReleasesView: View {
                 List {
                     ForEach(distros.filter { grouped[$0] != nil }, id: \.self) { distro in
                         Section(distroDisplayName(distro)) {
-                            ForEach(grouped[distro] ?? []) { entry in
-                                ReleaseRow(entry: entry)
+                            if distro == macosDistro {
+                                MacOSReleaseRows(entries: grouped[distro] ?? [])
+                            } else {
+                                ForEach(grouped[distro] ?? []) { entry in
+                                    ReleaseRow(entry: entry)
+                                }
                             }
                         }
                     }
@@ -56,9 +60,34 @@ struct ReleasesView: View {
     }
 }
 
+/// The newest build of each macOS major version, with every other build
+/// Apple has published folded away underneath.
+private struct MacOSReleaseRows: View {
+    let entries: [CatalogEntry]
+    @State private var showAll = false
+
+    var body: some View {
+        let newest = newestMacOSPerMajor(entries)
+        let older = entries.filter { !newest.contains($0) }
+        ForEach(newest) { entry in
+            ReleaseRow(entry: entry, isDefault: entry == newest.first)
+        }
+        if !older.isEmpty {
+            DisclosureGroup("All Builds (\(older.count) more)", isExpanded: $showAll) {
+                ForEach(older) { entry in
+                    ReleaseRow(entry: entry, isDefault: false)
+                }
+            }
+        }
+    }
+}
+
 private struct ReleaseRow: View {
     @Environment(AppModel.self) private var model
     let entry: CatalogEntry
+    /// Overrides the default tag, which every macOS row would otherwise get.
+    var isDefault: Bool? = nil
+    @State private var confirmDelete = false
 
     var body: some View {
         let downloaded = model.isDownloaded(entry)
@@ -71,7 +100,10 @@ private struct ReleaseRow: View {
                     Text("\(entry.distro)/\(entry.variant)")
                         .font(.headline)
                     Tag("v\(entry.version)", color: .gray)
-                    if entry.variant == defaultVariant(entry.distro) {
+                    if entry.distro == macosDistro, let build = macosBuildFromIPSWName(entry.url) {
+                        Tag(build, color: .gray)
+                    }
+                    if isDefault ?? (entry.variant == defaultVariant(entry.distro)) {
                         Tag("default", color: .blue)
                     }
                     if downloaded {
@@ -102,5 +134,37 @@ private struct ReleaseRow: View {
             .help(entry.distro == macosDistro ? "Download Apple's restore image and install it in a throwaway macOS VM" : "Boot in a throwaway VM")
         }
         .padding(.vertical, 4)
+        // Right-clicks in the row's blank space open the menu too.
+        .contentShape(Rectangle())
+        .contextMenu {
+            if let path = model.downloadedPath(entry) {
+                Button("Boot") { model.downloadRelease(entry, bootAfter: true) }
+                    .disabled(downloading)
+                Button("Verify") { model.downloadRelease(entry, bootAfter: false) }
+                    .disabled(downloading || !verifiable)
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([path])
+                }
+                Divider()
+                Button("Move Download to Trash…", role: .destructive) { confirmDelete = true }
+            } else {
+                Button("Download") { model.downloadRelease(entry, bootAfter: false) }
+                    .disabled(downloading)
+                Button("Get & Boot") { model.downloadRelease(entry, bootAfter: true) }
+                    .disabled(downloading)
+            }
+        }
+        .confirmationDialog(
+            "Move \(getFilename(distro: entry.distro, arch: entry.arch, url: entry.url)) to the Trash?",
+            isPresented: $confirmDelete
+        ) {
+            Button("Move to Trash", role: .destructive) {
+                if let path = model.downloadedPath(entry) {
+                    model.deleteImage(path)
+                }
+            }
+        } message: {
+            Text("You can download it again from here.")
+        }
     }
 }

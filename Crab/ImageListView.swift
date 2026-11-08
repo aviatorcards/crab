@@ -19,6 +19,8 @@ struct ImageListView: View {
             } else {
                 List(model.images) { img in
                     ImageRow(img: img)
+                        // Right-clicks in the row's blank space open the menu too.
+                        .contentShape(Rectangle())
                         .contextMenu {
                             Button("Boot") { model.bootImage(img.path) }
                             Button("Show in Finder") {

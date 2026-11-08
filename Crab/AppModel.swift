@@ -171,7 +171,7 @@ final class AppModel {
     /// Images being prepared for boot (scanned, disk created) before QEMU starts.
     private(set) var booting: Set<String> = []
     /// macOS guests this process is showing. The window controller keeps the VM alive.
-    @ObservationIgnored private var guestWindows: [String: MacOSGuestWindowController] = []
+    @ObservationIgnored private var guestWindows: [String: MacOSGuestWindowController] = [:]
     /// Guests already handed to the keep/discard prompt, so a close and a stop don't both ask.
     @ObservationIgnored private var finishedGuests: Set<String> = []
 
@@ -795,6 +795,12 @@ final class AppModel {
     }
 
     // MARK: - Releases
+
+    /// Where a release's file is in the search folder, if it's been downloaded.
+    func downloadedPath(_ entry: CatalogEntry) -> URL? {
+        let url = paths.searchDir.appending(path: getFilename(distro: entry.distro, arch: entry.arch, url: entry.url))
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
 
     func isDownloaded(_ entry: CatalogEntry) -> Bool {
         let file = getFilename(distro: entry.distro, arch: entry.arch, url: entry.url)
