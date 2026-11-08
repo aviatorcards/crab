@@ -488,47 +488,120 @@ public func pickFreePort(_ paths: Paths, ownDir: URL) -> UInt16? {
     return (2222..<2300).first { !taken.contains($0) && !portInUse(String($0)) }
 }
 
-func afterThrowaway(_ paths: Paths, scratch: URL, image: URL?, defaultName: String, live: Bool) throws(CrabError) {
+/// Keep is offered for every throwaway that had a disk. Allocated size is
+/// not evidence that the guest wrote nothing: a qcow2 cluster is small, and
+/// a real install can land well under 1 MB.
+public func throwawayShouldOfferKeep(live: Bool) -> Bool {
+    !live
+}
+
+/// The name used when the user accepts the suggested one or types their own.
+/// Same rules as `checkName`, so a kept VM is a name other commands accept.
+func resolvedKeepName(_ input: String, defaultName: String) throws(CrabError) -> String {
+    let name = input.trimmed.isEmpty ? defaultName : input.trimmed
+    try checkName(name)
+    return name
+}
+
+enum ThrowawayChoice {
+    case discard
+    case keep
+}
+
+/// Applies a Keep or Discard chosen after QEMU has exited.
+/// Discard removes `scratch`. Keep moves it. A failed move leaves it in place.
+func applyThrowawayChoice(_ choice: ThrowawayChoice, scratch: URL, dest: URL) throws(CrabError) {
+    switch choice {
+    case .discard:
+        try? FileManager.default.removeItem(at: scratch)
+    case .keep:
+        try keepScratchVM(scratch, to: dest)
+    }
+}
+
+/// The user chose Keep and then input ended. Does not touch `scratch`.
+func abandonKeep(_ scratch: URL) throws(CrabError) -> Never {
+    throw CrabError("no name given; the VM was not deleted and is still at \(scratch.path)")
+}
+
+/// Moves a finished scratch VM to `dest`. On failure the scratch directory,
+/// including its gui-session marker, is left where it is.
+public func keepScratchVM(_ scratch: URL, to dest: URL) throws(CrabError) {
     let fm = FileManager.default
+    let parent = dest.deletingLastPathComponent()
+    do {
+        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+    } catch {
+        throw CrabError("failed to create \(parent.path): \(error.localizedDescription). The VM was not deleted and is still at \(scratch.path)")
+    }
+    // The pid and socket describe a QEMU that has already exited. Drop them
+    // before the move so a reused pid can't make the saved VM look running.
+    // The gui-session marker stays until the move succeeds; cleanup refuses
+    // to delete a scratch dir that still has one.
+    try? fm.removeItem(at: scratch.appending(path: "qemu.pid"))
+    try? fm.removeItem(at: QMP.socketPath(scratch))
+    do {
+        try fm.moveItem(at: scratch, to: dest)
+    } catch {
+        throw CrabError("failed to move the VM to \(dest.path): \(error.localizedDescription). The VM was not deleted and is still at \(scratch.path)")
+    }
+    try? fm.removeItem(at: dest.appending(path: "gui-session"))
+    try? fm.removeItem(at: dest.appending(path: "qemu.pid"))
+    try? fm.removeItem(at: QMP.socketPath(dest))
+}
+
+public enum ScratchDiscard: Sendable {
+    case trash
+    case delete
+}
+
+/// Removes a finished scratch VM. The directory, marker included, is left
+/// untouched when this throws.
+public func discardScratch(_ scratch: URL, how: ScratchDiscard) throws(CrabError) {
+    do {
+        switch how {
+        case .trash:
+            try FileManager.default.trashItem(at: scratch, resultingItemURL: nil)
+        case .delete:
+            try FileManager.default.removeItem(at: scratch)
+        }
+    } catch {
+        throw CrabError("failed to discard the VM at \(scratch.path): \(error.localizedDescription). It is still there.")
+    }
+}
+
+func afterThrowaway(_ paths: Paths, scratch: URL, image: URL?, defaultName: String, live: Bool) throws(CrabError) {
     let disk = scratch.appending(path: "disk.qcow2")
-    if !live {
-        if diskKB(disk) < 1024 {
-            print("Nothing was written to the disk, so there's nothing to keep.")
-        } else if askYes("Keep this VM (\(humanSize(disk)))?") {
-            while true {
-                guard let input = promptLine("Name [\(defaultName)]: ") else {
-                    try? fm.removeItem(at: scratch)
-                    throw CrabError("no name given; discarding the VM")
-                }
-                let name = input.trimmed.isEmpty ? defaultName : input.trimmed
-                if name.isEmpty || name.hasPrefix(".") || name.contains("/") {
-                    print("Names can't start with a dot or contain '/'.")
-                    continue
-                }
-                let dest = paths.vmRoot.appending(path: name, directoryHint: .isDirectory)
-                if dest.exists {
-                    print("There's already a VM called '\(name)'.")
-                    continue
-                }
-                try? fm.removeItem(at: scratch.appending(path: "qemu.pid"))
-                try? fm.removeItem(at: QMP.socketPath(scratch))
-                do {
-                    try fm.moveItem(at: scratch, to: dest)
-                } catch {
-                    throw CrabError("failed to move scratch VM to \(dest.path): \(error.localizedDescription)")
-                }
-                print("Kept as '\(name)'. Boot it again with: crab boot \(name)")
-                return
+    if throwawayShouldOfferKeep(live: live), askYes("Keep this VM (\(humanSize(disk)))?") {
+        while true {
+            guard let input = promptLine("Name [\(defaultName)]: ") else {
+                try abandonKeep(scratch)
             }
+            let name: String
+            do {
+                name = try resolvedKeepName(input, defaultName: defaultName)
+            } catch {
+                print(error.message)
+                continue
+            }
+            let dest = paths.vmRoot.appending(path: name, directoryHint: .isDirectory)
+            if dest.exists {
+                print("There's already a VM called '\(name)'.")
+                continue
+            }
+            try applyThrowawayChoice(.keep, scratch: scratch, dest: dest)
+            print("Kept as '\(name)'. Boot it again with: crab boot \(name)")
+            return
         }
     }
 
-    try? fm.removeItem(at: scratch)
+    try applyThrowawayChoice(.discard, scratch: scratch, dest: scratch)
     print("Throwaway VM deleted.")
     if let image, image.isFile {
         let base = baseName(image)
-        if askYes("Delete the image \(base) (\(humanSize(image))) too?") {
-            try? fm.removeItem(at: image)
+        let kind = isSymlink(image) ? "link " : ""
+        if askYes("Delete the image \(kind)\(base) (\(humanSize(pathOpenedForBoot(image)))) too?") {
+            try? removeImageEntry(image)
             print("Deleted \(base).")
         }
     }
@@ -862,7 +935,9 @@ func buildQemuCommand(
     }
 
     if let img = req.image {
-        let path = img.path.path
+        // Open the target of a symlink. The path stored on the request stays
+        // the directory entry, which is what a later delete removes.
+        let path = pathOpenedForBoot(img.path).path
         if !img.isCD {
             args += ["-drive", "file=\(path),if=\(diskIf),format=raw,snapshot=on"]
         } else if arch == "arm64" {
@@ -1020,7 +1095,8 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
     if let vn = vmName, !vn.isEmpty {
         vmDir = try vmPath(paths, vn)
     } else if let imageArg {
-        image = absPath(imageArg)
+        // Keep the directory entry. QEMU opens pathOpenedForBoot; delete removes this path.
+        image = imageEntryPath(imageArg)
     } else {
         switch try pickFromMenu(paths) {
         case .image(let p): image = p
@@ -1118,18 +1194,26 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
         mode: mode, vmDir: targetDir, image: image.map(ImageInfo.probe), arch: arch,
         defaultName: defaultName, newVM: newVM
     )
-    do {
-        try runCLIBoot(paths, opts, req)
-    } catch {
-        if let scratchDir {
-            try? FileManager.default.removeItem(at: scratchDir)
-        }
-        throw error
-    }
+    // unbootedScratch is removed only if QEMU never starts. After it has
+    // run, afterThrowaway owns the directory: a failed Keep must not delete it.
+    try runCLIBoot(paths, opts, req, unbootedScratch: scratchDir)
 }
 
-func runCLIBoot(_ paths: Paths, _ opts: BootOptions, _ req: BootRequest) throws(CrabError) {
-    let plan = try prepareBoot(paths, opts, req, forceWindow: false)
+/// Removes a scratch dir QEMU never started in. Callers must not use this
+/// once the guest has run.
+func deleteUnbootedScratch(_ dir: URL?) {
+    guard let dir else { return }
+    try? FileManager.default.removeItem(at: dir)
+}
+
+func runCLIBoot(_ paths: Paths, _ opts: BootOptions, _ req: BootRequest, unbootedScratch: URL?) throws(CrabError) {
+    let plan: BootPlan
+    do {
+        plan = try prepareBoot(paths, opts, req, forceWindow: false)
+    } catch {
+        deleteUnbootedScratch(unbootedScratch)
+        throw error
+    }
     let s = plan.settings
     for note in plan.notes {
         print(note)
@@ -1190,8 +1274,9 @@ func runCLIBoot(_ paths: Paths, _ opts: BootOptions, _ req: BootRequest) throws(
         do {
             status = try runInheriting(qemuBin, plan.args)
         } catch {
+            // run() throws only when the process could not be started.
             signal(SIGINT, SIG_DFL)
-            try? FileManager.default.removeItem(at: req.vmDir)
+            deleteUnbootedScratch(unbootedScratch)
             throw CrabError("failed to run \(plan.qemu): \(error.localizedDescription)")
         }
         signal(SIGINT, SIG_DFL)
@@ -1241,16 +1326,43 @@ public struct ThrowawayInfo: Sendable, Identifiable, Hashable {
 
 /// The file in a scratch dir that marks it as the app's (crab-only; CLI
 /// throwaways don't have one, since the CLI asks about them itself).
+/// `state` is `running` while QEMU is up and `pending` once it has exited
+/// and the app is waiting for Keep or Discard. Cleanup leaves any directory
+/// with this file alone, whichever state it is in.
+public let guiSessionRunning = "running"
+public let guiSessionPending = "pending"
+
 public func throwawayInfoFile(_ dir: URL) -> URL {
     dir.appending(path: "gui-session")
 }
 
+/// True when the app can still adopt this scratch dir: QEMU is running, or
+/// the user has not finished Keep/Discard. The marker is removed only after
+/// that succeeds.
+func scratchIsRecoverable(_ dir: URL) -> Bool {
+    throwawayInfoFile(dir).isFile
+}
+
 func saveThrowawayInfo(_ info: ThrowawayInfo) throws {
-    var lines = ["name=\(info.defaultName)", "live=\(info.live ? "on" : "off")"]
+    var lines = [
+        "name=\(info.defaultName)",
+        "live=\(info.live ? "on" : "off")",
+        "state=\(guiSessionRunning)",
+    ]
     if let image = info.imagePath {
         lines.append("image=\(image.path)")
     }
     try (lines.joined(separator: "\n") + "\n").write(to: throwawayInfoFile(info.dir), atomically: true, encoding: .utf8)
+}
+
+/// Records that QEMU has exited and the scratch dir is waiting on the user.
+/// A failure leaves the previous marker in place, which cleanup also keeps.
+public func markThrowawayPending(_ dir: URL) {
+    let file = throwawayInfoFile(dir)
+    guard var lines = (try? String(contentsOf: file, encoding: .utf8))?.lines else { return }
+    lines = lines.filter { !$0.trimmed.hasPrefix("state=") }
+    lines.append("state=\(guiSessionPending)")
+    try? (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
 }
 
 /// Throwaway VMs the app started, running or not, found in the scratch folder.
@@ -1292,7 +1404,7 @@ public func spawnFromGUI(
 ) throws(CrabError) -> SpawnedVM {
     var arch = ""
     var defaultName = ""
-    let image = imagePath.map(absPath)
+    let image = imagePath.map(imageEntryPath)
 
     let mode: BootMode
     if image == nil {
@@ -1371,9 +1483,10 @@ public func spawnFromGUI(
         }
         return spawned
     } catch {
-        if let scratchDir {
-            try? FileManager.default.removeItem(at: scratchDir)
-        }
+        // This catch runs only if QEMU was not started: prepareBoot, writing
+        // the session file, or process.run() failed. A running guest is
+        // handled from the termination handler, which must not delete it.
+        deleteUnbootedScratch(scratchDir)
         throw error
     }
 }

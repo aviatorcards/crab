@@ -56,4 +56,53 @@ struct ConfigTests {
         #expect(isCDImage(iso) && isBSDImage(iso))
         #expect(detectArch(iso) == ["amd64"])
     }
+
+    /// Deleting a listed symlink removes the link. The file it points at stays,
+    /// and QEMU is given that file. Older history lines that stored the resolved
+    /// path still count as a boot of the link.
+    @Test func symlinkImagesDeleteTheLink() throws {
+        let fm = FileManager.default
+        let root = testDir("symlink-image")
+        let paths = Paths(root: root)
+        let outside = root.appending(path: "outside", directoryHint: .isDirectory)
+        try fm.createDirectory(at: paths.searchDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let target = outside.appending(path: "payload.bin")
+        let link = paths.searchDir.appending(path: "os.iso")
+        var payload = Data("ISO-BYTES".utf8)
+        payload.append(Data(count: 8192))
+        try payload.write(to: target)
+        try fm.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let listed = listImagePaths(paths)
+        #expect(listed.map(\.lastPathComponent) == ["os.iso"])
+        let entry = try #require(listed.first)
+        #expect(isSymlink(entry))
+        #expect(pathOpenedForBoot(entry).lastPathComponent == "payload.bin")
+        #expect(!isSymlink(pathOpenedForBoot(entry)))
+
+        let entries = listImageEntries(paths)
+        #expect(entries.count == 1)
+        #expect(entries[0].name == "os.iso")
+        #expect(entries[0].sizeKB == diskKB(target))
+        #expect(entries[0].sizeKB > diskKB(link))
+
+        let resolved = entry.resolvingSymlinksInPath().path
+        #expect(resolved != entry.path)
+        try "1700000000\t\(resolved)\n".write(to: paths.history, atomically: true, encoding: .utf8)
+        #expect(imageLastBoot(paths, entry) == 1700000000)
+        logImageBoot(paths, entry, dryRun: false)
+        let last = read(paths.history).split(separator: "\n").last.map(String.init) ?? ""
+        #expect(last.hasSuffix("\t" + imageEntryPath(entry).path))
+
+        try removeImageEntry(entry)
+        #expect(!fm.fileExists(atPath: link.path))
+        #expect(try Data(contentsOf: target).prefix(9) == Data("ISO-BYTES".utf8))
+        #expect(listImagePaths(paths).isEmpty)
+
+        #expect(throws: CrabError.self) { try removeImageEntry(paths.searchDir) }
+        #expect(fm.fileExists(atPath: paths.searchDir.path))
+        #expect(throws: CrabError.self) { try trashImageEntry(paths.searchDir) }
+        #expect(fm.fileExists(atPath: paths.searchDir.path))
+    }
 }

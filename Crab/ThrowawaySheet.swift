@@ -26,9 +26,6 @@ struct ThrowawaySheet: View {
                         .font(.callout)
                         .foregroundStyle(.red)
                 }
-            } else if !prompt.live {
-                Text("Nothing much was written to its disk (under 1 MB), so there's nothing worth keeping.")
-                    .foregroundStyle(.secondary)
             }
 
             Divider()
