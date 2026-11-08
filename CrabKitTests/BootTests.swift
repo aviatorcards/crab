@@ -313,11 +313,11 @@ struct BootTests {
             return url
         }
         #expect(unsupportedImageReason(try file("debian-12-ppc64el-netinst.iso"))?.contains("64-bit POWER") == true)
-        #expect(unsupportedImageReason(try file("NetBSD-11.0-sparc64.iso"))?.contains("SPARC") == true)
+        #expect(unsupportedImageReason(try file("NetBSD-11.0-sparc.iso"))?.contains("32-bit SPARC") == true)
         #expect(unsupportedImageReason(try file("haiku-arm-mmc.image"))?.contains("32-bit ARM") == true)
         #expect(unsupportedImageReason(try file("app.dmg"))?.contains(".dmg") == true)
         #expect(unsupportedImageReason(try file("plain.iso")) == nil)
-        #expect(throws: CrabError.self) { try detectBootableArch(dir.appending(path: "NetBSD-11.0-sparc64.iso")) }
+        #expect(throws: CrabError.self) { try detectBootableArch(dir.appending(path: "NetBSD-11.0-sparc.iso")) }
         #expect(try detectBootableArch(dir.appending(path: "plain.iso")).isEmpty)
     }
 
@@ -401,6 +401,72 @@ struct BootTests {
             -nic user,model=sungem,hostfwd=tcp:127.0.0.1:2222-:22 -pidfile /vms/test/qemu.pid \
             -qmp unix:/vms/test/qmp.sock,server=on,wait=off \
             -drive file=/img/macos_921_ppc.iso,media=cdrom,readonly=on,index=2 -boot d \
+            -display cocoa,zoom-to-fit=on,full-screen=off
+            """)
+        #expect(cmd.fwCode == nil && cmd.fwVarsTemplate == nil)
+
+        let saved = try buildQemuCommand(s, request(.vm), hostArch: "arm64", uefi: share, forceWindow: false)
+        #expect(saved.args.joined(separator: " ").contains("-boot c"), "boots the disk with no CD attached")
+    }
+
+    // MARK: - SPARC64 (Sun Ultra 5)
+
+    @Test func sparc64Detection() throws {
+        #expect(CrabKit.archFromName("debian-10.0-sparc64-netinst.iso") == "sparc64")
+        #expect(CrabKit.archFromName("openbsd-76-sparc64.iso") == "sparc64")
+        #expect(CrabKit.archFromName("solaris-sun4u.iso") == "sparc64")
+
+        let dir = testDir("sparc64")
+        let disc = dir.appending(path: "debian-sparc64.iso")
+        try Data(count: 4096).write(to: disc)
+        #expect(try detectBootableArch(disc) == ["sparc64"])
+        #expect(defaultVMName(disc, arch: "sparc64") == "debian-sparc64")
+        let generic = dir.appending(path: "solaris.img")
+        #expect(defaultVMName(generic, arch: "sparc64") == "solaris-sparc64")
+    }
+
+    @Test func sparc64Settings() throws {
+        let debian = image("debian-sparc64.iso", isCD: true, isBSD: false)
+        var (s, notes) = try resolve(arch: "sparc64", image: debian, newVM: true)
+        #expect(s.mem == "2G" && s.cpus == "1")
+        #expect(s.firmware == "openbios" && s.hw == "sun4u" && s.display == "window")
+        #expect(notes.isEmpty)
+
+        var opts = BootOptions()
+        opts.cpus = "2"
+        (s, notes) = try resolve(opts, arch: "sparc64", image: debian, newVM: true)
+        #expect(s.cpus == "1")
+        #expect(notes == ["SPARC64 (sun4u) have one CPU; using 1."])
+
+        opts = BootOptions()
+        opts.firmware = "bios"
+        #expect(throws: CrabError.self) { try resolve(opts, arch: "sparc64", newVM: true) }
+        opts = BootOptions()
+        opts.hw = "legacy"
+        #expect(throws: CrabError.self) { try resolve(opts, arch: "sparc64", newVM: true) }
+
+        #expect(throws: CrabError.self) { try validateSetting("cpus", "2", arch: "sparc64") }
+        #expect(throws: CrabError.self) { try validateSetting("firmware", "uefi", arch: "sparc64") }
+        #expect(throws: CrabError.self) { try validateSetting("hw", "standard", arch: "sparc64") }
+    }
+
+    @Test func sparc64Command() throws {
+        var s = settings("sparc64")
+        s.firmware = "openbios"
+        s.hw = "sun4u"
+        s.mem = "2G"
+        s.cpus = "1"
+        s.forwards = []
+        let req = request(.throwaway, image("debian-sparc64.iso", isCD: true, isBSD: false))
+        let cmd = try buildQemuCommand(s, req, hostArch: "arm64", uefi: share, forceWindow: false)
+        #expect(cmd.qemu == "qemu-system-sparc64")
+        #expect(cmd.args.joined(separator: " ") == """
+            -M sun4u -accel tcg \
+            -name test -m 2G -smp 1 \
+            -drive file=/vms/test/disk.qcow2,if=ide,format=qcow2 \
+            -nic user,model=sunhme,hostfwd=tcp:127.0.0.1:2222-:22 -pidfile /vms/test/qemu.pid \
+            -qmp unix:/vms/test/qmp.sock,server=on,wait=off \
+            -drive file=/img/debian-sparc64.iso,media=cdrom,readonly=on,index=2 -boot d \
             -display cocoa,zoom-to-fit=on,full-screen=off
             """)
         #expect(cmd.fwCode == nil && cmd.fwVarsTemplate == nil)

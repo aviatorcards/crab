@@ -109,10 +109,11 @@ public func parseArgs(_ rawArgs: [String]) throws(CrabError) -> CLI {
         throw CrabError("-H wants standard, virtio or legacy")
     }
     switch opts.arch {
-    case nil, "", "arm64", "amd64": break
+    case nil, "", "arm64", "amd64", "sparc64": break
     case "aarch64": cli.opts.arch = "arm64"
     case "x86_64": cli.opts.arch = "amd64"
-    default: throw CrabError("-a wants arm64 or amd64")
+    case "sun4u": cli.opts.arch = "sparc64"
+    default: throw CrabError("-a wants arm64, amd64 or sparc64")
     }
     if opts.keep && opts.live {
         throw CrabError("-k and -l don't go together")
@@ -166,8 +167,8 @@ public func usageText(_ paths: Paths) -> String {
            crab delsnap NAME TAG        delete a snapshot
 
     Images boot in a throwaway VM: when QEMU exits you're asked whether to keep
-    it, and if not, its disk is deleted. crab boots arm64, x86 (amd64, i386)
-    and PowerPC Mac (ppc: Mac OS 9, Mac OS X up to 10.5) guests.
+    it, and if not, its disk is deleted. crab boots arm64, x86 (amd64, i386),
+    PowerPC Mac (ppc: Mac OS 9, Mac OS X up to 10.5) and SPARC64 (sparc64: Sun Ultra 5) guests.
 
     Boot options:
       -s DIR    where to look for (and download) .iso/.img files (default: ~/Downloads)

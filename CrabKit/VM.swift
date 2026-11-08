@@ -605,6 +605,9 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
         if arch == "ppc" && value != "1" {
             throw CrabError("PowerPC Macs (mac99) have one CPU")
         }
+        if arch == "sparc64" && value != "1" {
+            throw CrabError("SPARC64 (sun4u) has one CPU")
+        }
         return value
     case "ssh_port":
         guard validPort(value) else { throw CrabError("ssh_port wants a port number (0 turns it off)") }
@@ -620,6 +623,9 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
         if arch == "ppc" {
             throw CrabError("PowerPC Macs always boot with Open Firmware")
         }
+        if arch == "sparc64" {
+            throw CrabError("SPARC64 guests always boot with OpenBIOS")
+        }
         if arch == "arm64" && value == "bios" {
             throw CrabError("arm64 guests always boot with UEFI")
         }
@@ -630,6 +636,9 @@ public func validateSetting(_ key: String, _ value: String, arch: String) throws
     case "hw":
         if arch == "ppc" {
             throw CrabError("PowerPC Macs always use mac99 hardware")
+        }
+        if arch == "sparc64" {
+            throw CrabError("SPARC64 guests always use sun4u hardware")
         }
         if arch == "arm64" && value != "virtio" {
             throw CrabError("arm64 guests always use virtio hardware")

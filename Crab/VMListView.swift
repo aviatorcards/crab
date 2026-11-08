@@ -24,7 +24,7 @@ struct VMListView: View {
                         }
                     } else {
                         Section("Running Throwaway VMs") {
-                            ForEach(model.runningThrowaways, id: \.process.processIdentifier) { vm in
+                            ForEach(model.runningThrowaways) { vm in
                                 ThrowawayRow(vm: vm)
                             }
                         }
@@ -84,7 +84,7 @@ struct VMListView: View {
 /// A throwaway or live VM started from the app that's still running.
 private struct ThrowawayRow: View {
     @Environment(AppModel.self) private var model
-    let vm: SpawnedVM
+    let vm: ThrowawayInfo
 
     var body: some View {
         let busy = model.vmOps.contains(vm.defaultName)
@@ -97,11 +97,14 @@ private struct ThrowawayRow: View {
                 HStack(spacing: 6) {
                     Text(vm.defaultName)
                         .font(.headline)
+                        .lineLimit(1)
                     Tag(vm.live ? "live" : "throwaway", color: .orange)
+                        .layoutPriority(1)
                 }
                 if let image = vm.imagePath {
                     Text("from \(image.lastPathComponent)")
                         .font(.callout)
+                        .lineLimit(1)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -110,12 +113,10 @@ private struct ThrowawayRow: View {
                 ProgressView()
                     .controlSize(.small)
             }
-            if let dir = vm.scratchDir {
-                SendKeyMenu(dir: dir, name: vm.defaultName)
-                    .disabled(busy)
-                ChangeDiscMenu(dir: dir, name: vm.defaultName)
-                    .disabled(busy)
-            }
+            SendKeyMenu(dir: vm.dir, name: vm.defaultName)
+                .disabled(busy)
+            ChangeDiscMenu(dir: vm.dir, name: vm.defaultName)
+                .disabled(busy)
             Button("Force Off", role: .destructive) { model.forceOffThrowaway(vm) }
                 .disabled(busy)
         }
@@ -212,16 +213,21 @@ private struct VMRow: View {
                 HStack(spacing: 6) {
                     Text(vm.name)
                         .font(.headline)
-                    Tag(vm.arch.isEmpty ? "?" : vm.arch, color: .blue)
-                    if !vm.firmware.isEmpty {
-                        Tag(vm.firmware, color: .gray)
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Tag(vm.arch.isEmpty ? "?" : vm.arch, color: .blue)
+                        if !vm.firmware.isEmpty {
+                            Tag(vm.firmware, color: .gray)
+                        }
+                        if running {
+                            Tag(vm.state, color: .green)
+                        }
                     }
-                    if running {
-                        Tag(vm.state, color: .green)
-                    }
+                    .layoutPriority(1)
                 }
                 Text(details)
                     .font(.callout)
+                    .lineLimit(1)
                     .foregroundStyle(.secondary)
             }
 
@@ -277,10 +283,12 @@ struct Tag: View {
     var body: some View {
         Text(text.uppercased())
             .font(.caption2.weight(.semibold))
+            .lineLimit(1)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .foregroundStyle(color)
             .background(color.opacity(0.15), in: .capsule)
+            .fixedSize()
     }
 }
 

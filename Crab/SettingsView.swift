@@ -230,6 +230,7 @@ public struct SettingsView: View {
                 Picker("Default Architecture", selection: $bindableModel.arch) {
                     Text("ARM64 (Apple Silicon)").tag("arm64")
                     Text("x86_64 / AMD64 (Intel)").tag("amd64")
+                    Text("SPARC64 (Sun Ultra 5)").tag("sparc64")
                 }
                 Text("Fallback architecture used when an image's architecture cannot be detected automatically.")
                     .font(.caption)
@@ -266,6 +267,11 @@ public struct SettingsView: View {
                     LabeledContent("QEMU x86_64", value: x86Path)
                 } else {
                     LabeledContent("QEMU x86_64", value: "Not found")
+                }
+                if let sparcPath = model.detectedQemuSparc64Path {
+                    LabeledContent("QEMU SPARC64", value: sparcPath)
+                } else {
+                    LabeledContent("QEMU SPARC64", value: "Not found")
                 }
                 if let imgPath = model.detectedQemuImgPath {
                     LabeledContent("qemu-img", value: imgPath)

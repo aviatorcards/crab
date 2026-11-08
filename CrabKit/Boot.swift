@@ -96,6 +96,8 @@ public func archFromName(_ name: String) -> String? {
         return "amd64"
     } else if lower.contains("i386") || lower.contains("i686") || lower.contains("x86") {
         return "i386"
+    } else if lower.contains("sparc64") || lower.contains("sun4u") {
+        return "sparc64"
     }
     // Whole words only: "ppc" turns up inside other words, and ppc64 is
     // 64-bit POWER, which crab doesn't boot.
@@ -244,6 +246,9 @@ public func detectArch(_ url: URL) -> [String] {
     if label.contains("i386") {
         return ["i386"]
     }
+    if label.contains("sparc64") || label.contains("sun4u") {
+        return ["sparc64"]
+    }
     let platforms = elToritoPlatforms(url)
     let pcBootable = platforms.contains(BootPlatform.x86BIOS.rawValue) || platforms.contains(BootPlatform.uefi.rawValue)
     let macBootable = platforms.contains(BootPlatform.powerPC.rawValue) || platforms.contains(BootPlatform.mac.rawValue)
@@ -278,10 +283,10 @@ public func detectArch(_ url: URL) -> [String] {
 /// kind of machine. Cheap: it reads only the name and the first sectors.
 public func unsupportedImageReason(_ url: URL) -> String? {
     let base = url.lastPathComponent
-    let notSupported = "crab only boots arm64, x86 and PowerPC Mac guests"
+    let notSupported = "crab only boots arm64, x86, PowerPC Mac and SPARC64 guests"
     let cpus = [
         "ppc64": "64-bit POWER", "ppc64le": "64-bit POWER", "ppc64el": "64-bit POWER",
-        "sparc": "SPARC", "sparc64": "SPARC", "mips": "MIPS",
+        "sparc": "32-bit SPARC", "mips": "MIPS",
         "riscv64": "RISC-V", "m68k": "68k", "arm": "32-bit ARM", "armv7": "32-bit ARM", "armhf": "32-bit ARM",
     ]
     let words = url.fileStem.lowercased().split { !$0.isLetter && !$0.isNumber }
@@ -632,16 +637,18 @@ func resolveSettings(
     var notes: [String] = []
 
     let ppc = arch == "ppc"
+    let sparc64 = arch == "sparc64"
     // Mac OS 9 can't use more than 1.5G, and QEMU's mac99 has a single CPU.
     var mem = flagOrSaved(opts.mem, conf("mem")) ?? (ppc ? defaultPPCMem : defaultMem)
     if ppc, let mb = memMB(mem), mb > maxPPCMemMB {
         notes.append("PowerPC Macs get at most \(maxPPCMemMB)M (Mac OS 9 won't boot with more); using \(maxPPCMemMB)M.")
         mem = "\(maxPPCMemMB)M"
     }
-    var cpus = flagOrSaved(opts.cpus, conf("cpus")) ?? String(defaultCPUs)
-    if ppc && cpus != "1" {
+    var cpus = flagOrSaved(opts.cpus, conf("cpus")) ?? ((ppc || sparc64) ? "1" : String(defaultCPUs))
+    if (ppc || sparc64) && cpus != "1" {
         if opts.cpus != nil {
-            notes.append("PowerPC Macs (mac99) have one CPU; using 1.")
+            let desc = ppc ? "PowerPC Macs (mac99)" : "SPARC64 (sun4u)"
+            notes.append("\(desc) have one CPU; using 1.")
         }
         cpus = "1"
     }
@@ -682,6 +689,11 @@ func resolveSettings(
             throw CrabError("PowerPC Macs boot with Open Firmware; -f is for x86 guests")
         }
         firmware = "openbios"
+    } else if sparc64 {
+        if opts.firmware.map({ !$0.isEmpty }) == true {
+            throw CrabError("SPARC64 guests boot with OpenBIOS; -f is for x86 guests")
+        }
+        firmware = "openbios"
     } else if let f = flagOrSaved(opts.firmware, conf("firmware")) {
         firmware = f
     } else if let image, arch != "arm64", !hasEFI() {
@@ -703,13 +715,17 @@ func resolveSettings(
     // which DOS-era CD drivers, Windows 9x and XP understand. arm64 OSes all
     // speak virtio, and so did VMs from older versions of vmboot.
     // PowerPC VMs are always QEMU's mac99 (a G4 Power Mac).
+    // SPARC64 VMs are always QEMU's sun4u (a Sun Ultra 5).
     if ppc && opts.hw.map({ !$0.isEmpty }) == true {
         throw CrabError("PowerPC Macs always use mac99 hardware; -H is for x86 guests")
     }
-    let hw = ppc ? "mac99" : flagOrSaved(opts.hw, conf("hw")) ?? {
+    if sparc64 && opts.hw.map({ !$0.isEmpty }) == true {
+        throw CrabError("SPARC64 guests always use sun4u hardware; -H is for x86 guests")
+    }
+    let hw = ppc ? "mac99" : (sparc64 ? "sun4u" : flagOrSaved(opts.hw, conf("hw")) ?? {
         guard newVM && arch != "arm64" else { return "virtio" }
         return firmware == "bios" ? "legacy" : "standard"
-    }()
+    }())
     if arch == "arm64" && hw != "virtio" {
         throw CrabError("arm64 guests always use virtio hardware")
     }
@@ -785,6 +801,11 @@ func buildQemuCommand(
         args += ["-M", "mac99,via=pmu", "-accel", "tcg"]
         args += ["-prom-env", "auto-boot?=true", "-prom-env", "vga-ndrv?=true"]
         notes.append("Note: PowerPC guests run under emulation (works, but slow).")
+    case "sparc64":
+        // Sun Ultra 5 workstation, booting QEMU's built-in OpenBIOS.
+        qemu = "qemu-system-sparc64"
+        args += ["-M", "sun4u", "-accel", "tcg"]
+        notes.append("Note: SPARC64 guests run under emulation (works, but slow).")
     default:
         throw CrabError("unsupported architecture: \(arch)")
     }
@@ -804,6 +825,7 @@ func buildQemuCommand(
     case "standard": ("ide", "e1000")
     case "legacy": ("ide", "pcnet")
     case "mac99": ("ide", "sungem")
+    case "sun4u": ("ide", "sunhme")
     default: ("virtio", "virtio-net-pci")
     }
 
@@ -857,7 +879,7 @@ func buildQemuCommand(
     }
     // OpenBIOS boots one device and doesn't fall back to the next, so boot
     // the CD while one is attached.
-    if arch == "ppc" {
+    if arch == "ppc" || arch == "sparc64" {
         args += ["-boot", req.image?.isCD == true ? "d" : "c"]
     }
 
@@ -1039,7 +1061,7 @@ public func cmdBoot(_ paths: Paths, _ opts: BootOptions, vmName: String?, image 
                 let list: [String]
                 if candidates.isEmpty {
                     print("Couldn't detect the architecture of \(base).")
-                    list = ["arm64", "amd64", "i386", "ppc"]
+                    list = ["arm64", "amd64", "i386", "ppc", "sparc64"]
                 } else {
                     print("\(base) has boot loaders for more than one architecture. Which is it?")
                     list = candidates
@@ -1200,6 +1222,50 @@ public final class SpawnedVM: @unchecked Sendable {
         self.live = live
         self.qemuCommandLine = qemuCommandLine
     }
+
+    /// The throwaway VM this is, or nil for saved VMs.
+    public var throwaway: ThrowawayInfo? {
+        scratchDir.map { ThrowawayInfo(dir: $0, imagePath: imagePath, defaultName: defaultName, live: live) }
+    }
+}
+
+/// A throwaway or live VM started by the app. It's also saved in the scratch
+/// dir, so the app can pick it back up after quitting while QEMU runs on.
+public struct ThrowawayInfo: Sendable, Identifiable, Hashable {
+    public let dir: URL
+    public let imagePath: URL?
+    public let defaultName: String
+    public let live: Bool
+    public var id: URL { dir }
+}
+
+/// The file in a scratch dir that marks it as the app's (crab-only; CLI
+/// throwaways don't have one, since the CLI asks about them itself).
+public func throwawayInfoFile(_ dir: URL) -> URL {
+    dir.appending(path: "gui-session")
+}
+
+func saveThrowawayInfo(_ info: ThrowawayInfo) throws {
+    var lines = ["name=\(info.defaultName)", "live=\(info.live ? "on" : "off")"]
+    if let image = info.imagePath {
+        lines.append("image=\(image.path)")
+    }
+    try (lines.joined(separator: "\n") + "\n").write(to: throwawayInfoFile(info.dir), atomically: true, encoding: .utf8)
+}
+
+/// Throwaway VMs the app started, running or not, found in the scratch folder.
+public func listAppThrowaways(_ paths: Paths) -> [ThrowawayInfo] {
+    let entries = (try? FileManager.default.contentsOfDirectory(at: paths.scratchRoot, includingPropertiesForKeys: nil)) ?? []
+    return entries.compactMap { dir in
+        let file = throwawayInfoFile(dir)
+        guard dir.isDirectory, file.isFile else { return nil }
+        return ThrowawayInfo(
+            dir: dir,
+            imagePath: readConfigKey(file, "image").map { URL(filePath: $0) },
+            defaultName: readConfigKey(file, "name") ?? dir.lastPathComponent,
+            live: readConfigKey(file, "live") == "on"
+        )
+    }
 }
 
 /// The architecture the app boots an image as: one given outright, else the
@@ -1291,6 +1357,13 @@ public func spawnFromGUI(
             live: mode == .live, qemuCommandLine: plan.commandLine
         )
         process.terminationHandler = { _ in onExit(spawned) }
+        if let info = spawned.throwaway {
+            do {
+                try saveThrowawayInfo(info)
+            } catch {
+                throw CrabError("failed to write \(throwawayInfoFile(info.dir).path): \(error.localizedDescription)")
+            }
+        }
         do {
             try process.run()
         } catch {

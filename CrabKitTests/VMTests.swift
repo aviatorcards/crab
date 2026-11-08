@@ -93,4 +93,27 @@ struct VMTests {
         #expect { try requestShutdown(dir) } throws: { ($0 as? CrabError)?.message.contains("isn't running") == true }
         #expect(throws: CrabError.self) { try forceOff(dir) }
     }
+
+    /// The app finds its own throwaway VMs after a relaunch, but not the CLI's.
+    @Test func appThrowawaysSurviveARelaunch() throws {
+        let paths = Paths(root: testDir("throwaways"))
+        let fm = FileManager.default
+        let gui = paths.scratchRoot.appending(path: "AAAAAA", directoryHint: .isDirectory)
+        let live = paths.scratchRoot.appending(path: "BBBBBB", directoryHint: .isDirectory)
+        let cli = paths.scratchRoot.appending(path: "CCCCCC", directoryHint: .isDirectory)
+        for d in [gui, live, cli] {
+            try fm.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        let image = URL(filePath: "/isos/Mac OS 9.2.iso")
+        try saveThrowawayInfo(ThrowawayInfo(dir: gui, imagePath: image, defaultName: "macos9-ppc", live: false))
+        try saveThrowawayInfo(ThrowawayInfo(dir: live, imagePath: nil, defaultName: "alpine", live: true))
+
+        let found = listAppThrowaways(paths).sorted { $0.dir.path < $1.dir.path }
+        #expect(found.map(\.dir.lastPathComponent) == ["AAAAAA", "BBBBBB"])
+        #expect(found[0].imagePath == image)
+        #expect(found[0].defaultName == "macos9-ppc")
+        #expect(!found[0].live)
+        #expect(found[1].imagePath == nil)
+        #expect(found[1].live)
+    }
 }

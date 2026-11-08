@@ -70,6 +70,8 @@ Each setting is resolved in this order: CLI flag, then the VM's saved `vm.conf` 
 ~/VMs/<name>/qmp.sock     QMP control socket while running (not created by vmboot)
 ~/VMs/<name>/arch         legacy (pre-vm.conf) VMs only: confGet falls back to it
 ~/VMs/.scratch/           throwaway VMs
+~/VMs/.scratch/*/gui-session  name/image/live of an app-started throwaway, so a
+                          relaunched app can re-adopt it (crab-only)
 ~/VMs/.image-history      last-boot times per image
 ~/VMs/.catalog            synced release list (refreshed after 7 days)
 ~/VMs/mirrors             optional mirror overrides

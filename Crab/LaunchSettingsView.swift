@@ -37,6 +37,7 @@ struct LaunchSettingsView: View {
                 Picker("Architecture", selection: $model.arch) {
                     Text("arm64").tag("arm64")
                     Text("amd64").tag("amd64")
+                    Text("sparc64").tag("sparc64")
                 }
                 .help("Used when an image's architecture can't be detected")
                 Picker("Firmware", selection: $model.firmware) {

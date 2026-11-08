@@ -175,11 +175,15 @@ final class AppModel {
     private var reloadGen = 0
     /// QEMU processes started from this window.
     private var sessions: [ObjectIdentifier: SpawnedVM] = [:]
+    /// Throwaway VMs started by an earlier run of the app whose QEMU outlived it.
+    /// Polled until they exit, since they aren't our child processes.
+    private var adopted: [URL: ThrowawayInfo] = [:]
+    private var adoptedLeftovers = false
 
-    /// Throwaway and live VMs started from this window that are still running.
+    /// Throwaway and live VMs started from the app that are still running.
     /// Saved VMs show up in `vms` instead.
-    var runningThrowaways: [SpawnedVM] {
-        sessions.values.filter { $0.scratchDir != nil }.sorted { $0.defaultName < $1.defaultName }
+    var runningThrowaways: [ThrowawayInfo] {
+        (sessions.values.compactMap(\.throwaway) + adopted.values).sorted { $0.defaultName < $1.defaultName }
     }
 
     init() {
@@ -250,6 +254,10 @@ final class AppModel {
         findExecutable("qemu-system-x86_64")?.path
     }
 
+    var detectedQemuSparc64Path: String? {
+        findExecutable("qemu-system-sparc64")?.path
+    }
+
     var detectedQemuImgPath: String? {
         findExecutable("qemu-img")?.path
     }
@@ -285,8 +293,18 @@ final class AppModel {
     /// Polls the VMs' run states (which runs ps and talks QMP) every couple of
     /// seconds, reloading if any changed, so VMs started or stopped elsewhere show up.
     func pollStates() async {
+        await adoptLeftoverThrowaways()
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(2))
+            let adoptedDirs = Array(adopted.keys)
+            let exited = await Task.detached {
+                adoptedDirs.filter { vmPID($0) == nil }
+            }.value
+            for dir in exited {
+                if let info = adopted.removeValue(forKey: dir) {
+                    throwawayExited(info)
+                }
+            }
             let dirs = vms.map { ($0.name, $0.dir) }
             let states = await Task.detached {
                 dirs.map { ($0.0, vmState($0.1) ?? "stopped") }
@@ -389,20 +407,46 @@ final class AppModel {
     private func sessionExited(_ spawned: SpawnedVM) {
         sessions[ObjectIdentifier(spawned)] = nil
         reload()
-        guard let scratch = spawned.scratchDir else {
+        guard let info = spawned.throwaway else {
             status = "'\(spawned.defaultName)' stopped."
             return
         }
+        throwawayExited(info)
+    }
+
+    /// Picks up throwaway VMs from before the app last quit, once per launch:
+    /// still-running ones are listed (and asked about when they exit), and
+    /// ones that exited while the app was closed are asked about now.
+    private func adoptLeftoverThrowaways() async {
+        guard !adoptedLeftovers else { return }
+        adoptedLeftovers = true
+        let paths = paths
+        let found = await Task.detached {
+            listAppThrowaways(paths).map { ($0, vmPID($0.dir) != nil) }
+        }.value
+        let known = Set(sessions.values.compactMap(\.scratchDir) + throwawayPrompts.map(\.scratchDir))
+        for (info, running) in found where !known.contains(info.dir) {
+            if running {
+                adopted[info.dir] = info
+            } else {
+                throwawayExited(info)
+            }
+        }
+    }
+
+    private func throwawayExited(_ info: ThrowawayInfo) {
+        reload()
+        let scratch = info.dir
         let disk = scratch.appending(path: "disk.qcow2")
-        let usedKB = spawned.live ? 0 : diskKB(disk)
-        if !spawned.live && usedKB < 1024 && spawned.imagePath == nil {
+        let usedKB = info.live ? 0 : diskKB(disk)
+        if !info.live && usedKB < 1024 && info.imagePath == nil {
             try? FileManager.default.removeItem(at: scratch)
             status = "Throwaway VM exited with nothing written to its disk, so it was discarded."
             return
         }
         throwawayPrompts.append(ThrowawayPrompt(
-            scratchDir: scratch, imagePath: spawned.imagePath, name: spawned.defaultName,
-            diskSizeHuman: humanSize(disk), diskUsedKB: usedKB, live: spawned.live
+            scratchDir: scratch, imagePath: info.imagePath, name: info.defaultName,
+            diskSizeHuman: humanSize(disk), diskUsedKB: usedKB, live: info.live
         ))
     }
 
@@ -423,6 +467,7 @@ final class AppModel {
         }
         try? FileManager.default.removeItem(at: prompt.scratchDir.appending(path: "qemu.pid"))
         try? FileManager.default.removeItem(at: QMP.socketPath(prompt.scratchDir))
+        try? FileManager.default.removeItem(at: throwawayInfoFile(prompt.scratchDir))
         do {
             try FileManager.default.moveItem(at: prompt.scratchDir, to: dest)
         } catch {
@@ -500,8 +545,8 @@ final class AppModel {
     }
 
     /// Forces off a throwaway VM; its keep-or-discard prompt follows as usual.
-    func forceOffThrowaway(_ vm: SpawnedVM) {
-        guard let dir = vm.scratchDir else { return }
+    func forceOffThrowaway(_ vm: ThrowawayInfo) {
+        let dir = vm.dir
         vmOp(vm.defaultName, pending: "Forcing '\(vm.defaultName)' off...") { _ in
             report { () throws(CrabError) in try forceOff(dir) }
                 .map { "Couldn't force '\(vm.defaultName)' off: \($0)" } ?? "Forced '\(vm.defaultName)' off."
