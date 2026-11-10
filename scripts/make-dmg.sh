@@ -118,6 +118,27 @@ mkdir -p "$BUILD_DIR"
 
 # Command-line settings override the project's ad-hoc identity for this
 # archive only. project.yml and the xcodeproj are not edited.
+# Automatic signing accepts the generic identity ("Apple Development" or
+# "Developer ID Application"), not the full certificate common name. The
+# full name is still what we require on the signed app and DMG.
+if [[ "$SIGN_KIND" == "developer-id" ]]; then
+  SIGN_IDENTITY_SETTING="Developer ID Application"
+else
+  SIGN_IDENTITY_SETTING="Apple Development"
+fi
+# A generic macOS archive builds every architecture. Current main does not
+# compile the x86_64 slice: CrabKit calls VZMac* types that exist only in the
+# arm64 Virtualization SDK. This script does not patch that. It archives the
+# host architecture so the DMG matches the Mac it was built on.
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64|x86_64) ;;
+  *)
+    echo "Unexpected machine architecture: ${HOST_ARCH}" >&2
+    exit 1
+    ;;
+esac
+echo "Archiving host architecture: ${HOST_ARCH}"
 ARCHIVE_ARGS=(
   -project "$ROOT/Crab.xcodeproj"
   -scheme Crab
@@ -126,8 +147,10 @@ ARCHIVE_ARGS=(
   -archivePath "$ARCHIVE"
   -derivedDataPath "$DERIVED"
   -allowProvisioningUpdates
+  "ARCHS=${HOST_ARCH}"
+  ONLY_ACTIVE_ARCH=YES
   CODE_SIGN_STYLE=Automatic
-  "CODE_SIGN_IDENTITY=$IDENTITY"
+  "CODE_SIGN_IDENTITY=$SIGN_IDENTITY_SETTING"
   "DEVELOPMENT_TEAM=$TEAM_ID"
 )
 if [[ "$SIGN_KIND" == "developer-id" ]]; then
@@ -138,6 +161,41 @@ fi
 
 echo "Archiving Release Crab…"
 xcodebuild archive "${ARCHIVE_ARGS[@]}" 2>&1 | tee "$BUILD_DIR/archive.log"
+
+# The crab tool installs to /usr/local/bin and is also copied into
+# Crab.app/Contents/Helpers. That second product makes Xcode treat the
+# archive as a generic product archive, so it omits ApplicationProperties
+# and every Mac export method refuses it. The DMG only ships the app.
+prepare_archive_for_export() {
+  local products="$ARCHIVE/Products"
+  local app rel bid ver buildn
+  if [[ -d "$products/usr" ]]; then
+    echo "Removing the standalone crab product from the archive."
+    rm -rf "$products/usr"
+  fi
+  if /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:ApplicationPath' "$ARCHIVE/Info.plist" >/dev/null 2>&1; then
+    return 0
+  fi
+  app="$(find_app "$products" || true)"
+  if [[ -z "$app" ]]; then
+    echo "Archive has no Crab.app to describe." >&2
+    exit 1
+  fi
+  rel="Applications/$(basename "$app")"
+  bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+  ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+  buildn="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
+  /usr/libexec/PlistBuddy -c 'Add :ApplicationProperties dict' "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:ApplicationPath string ${rel}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c 'Add :ApplicationProperties:Architectures array' "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:Architectures:0 string ${HOST_ARCH}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:CFBundleIdentifier string ${bid}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:CFBundleShortVersionString string ${ver}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:CFBundleVersion string ${buildn}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:SigningIdentity string ${IDENTITY}" "$ARCHIVE/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :ApplicationProperties:Team string ${TEAM_ID}" "$ARCHIVE/Info.plist"
+  echo "Wrote ApplicationProperties so Xcode can export the Mac app."
+}
 
 write_export_plist() {
   local method="$1"
@@ -185,16 +243,18 @@ find_app() {
   return 1
 }
 
+prepare_archive_for_export
+
 exported=0
 if [[ "$SIGN_KIND" == "developer-id" ]]; then
   if export_archive developer-id; then
     exported=1
   fi
 else
-  # `development` still exports, and current Xcode also accepts `debugging`.
-  if export_archive development; then
+  # Xcode 27 prefers `debugging`. `development` still works and is deprecated.
+  if export_archive debugging; then
     exported=1
-  elif export_archive debugging; then
+  elif export_archive development; then
     exported=1
   elif export_archive mac-application; then
     exported=1
@@ -231,7 +291,8 @@ require_identity() {
   local target="$1"
   local label="$2"
   local sig
-  sig=$(codesign -dv "$target" 2>&1 || true)
+  # Authority lines are only printed at verbose level 3 and above.
+  sig=$(codesign -dvvv "$target" 2>&1 || true)
   printf '%s\n' "$sig" > "$BUILD_DIR/${label}-codesign.txt"
   if printf '%s\n' "$sig" | grep -q 'Signature=adhoc'; then
     echo "${label} is ad-hoc signed; expected ${IDENTITY}." >&2
